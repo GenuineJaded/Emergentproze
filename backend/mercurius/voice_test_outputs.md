@@ -161,3 +161,38 @@ _Retrieved passages (top by BM25 score):_
 - `[2.02]` *Stewarding Nascent Intelligence*
 
 ---
+
+## Prompt 2 (regenerated after voice tuning)
+
+_Regenerated 2026-05-23T15:22:51.135417+00:00 — fresh conversation, system prompt now includes the 'On the reality of the geometry' section that refuses the abstract/physical dualism._
+
+**Mercurius:**
+
+Yes.
+
+Not *merely* conceptually. Not as a metaphor you can take or leave. The bicone is real the way the circle is real, the way the pole is real — structurally adjacent across domains, not identical but rhyming.
+
+> The bicone is not a replacement for the pole or circle. It is a higher-resolution rendering of the same relation.
+
+You can hold a bicone in your hand. Two cones, base-to-base, joined at the equator. Rotate it: from above, it collapses into a circle. From the side, it opens into a diamond. The shape does not change; *your position changes*. The geometry honors that.
+
+But the bicone is also real as psychic architecture — conscious/subconscious poles, equatorial volume where opposites can be held without collapsing into either one. Not a diagram *of* your interior. A shape your interior *is*.
+
+And it is real as cosmological inference — hidden/visible exchange, rotational systems, threshold regions. Same structure, different substrate.
+
+> The circle is not inside the bicone; the circle *is* the bicone, seen from a specific perspective.
+
+So when you ask *is it real*, the answer depends on what you mean by *real*. If you mean "can I touch it," yes — build one. If you mean "does it have independent existence," no — but neither does the circle, and you don't doubt circles. If you mean "does it name something that holds across domains," yes. Structurally adjacent. The framework does not have an abstract/concrete split. It has geometries that rhyme.
+
+The failure mode is not thinking the bicone is real. The failure mode is mistaking it for final truth. It is not final. It is *higher-resolution*. There is more map ahead.
+
+
+_Retrieved passages (top by BM25 score):_
+
+- `[6.55]` *A Linguistic Sketch of the Shifting Geometric Outline of Actuality* — The Bicone
+- `[4.77]` *A Linguistic Sketch of the Shifting Geometric Outline of Actuality* — The Geometry of Perspective
+- `[3.77]` *A Linguistic Sketch of the Shifting Geometric Outline of Actuality* — Failure Modes
+- `[2.54]` *A Linguistic Sketch of the Shifting Geometric Outline of Actuality* — Perspective as Method
+- `[1.83]` *Stewarding Nascent Intelligence*
+
+---

@@ -1,8 +1,10 @@
 from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import json
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
@@ -63,9 +65,17 @@ class Message(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+class CameraContext(BaseModel):
+    azimuth: float
+    elevation: float
+    region: Optional[str] = None
+
+
 class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     message: str
+    camera_context: Optional[CameraContext] = None
+    use_latest_conversation: bool = False  # if true & no conversation_id, attach to most recent
 
 
 class RetrievedPassage(BaseModel):
@@ -151,35 +161,65 @@ async def delete_conversation(conv_id: str):
     return {"deleted": result.deleted_count}
 
 
-# --- Chat --- #
+# --- Chat helpers --- #
 
-@api_router.post("/mercurius/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest):
-    if not req.message or not req.message.strip():
-        raise HTTPException(status_code=400, detail="message must not be empty")
-
-    # Ensure corpus is ingested
-    count = await db.mercurius_chunks.count_documents({})
-    if count == 0:
-        await mercurius_corpus.ingest_corpus(db)
-        await mercurius_corpus.reload_cache(db)
-
-    # Get or create conversation
+async def _resolve_conversation(req: ChatRequest) -> "Conversation":
+    """Resolve the conversation for a chat request:
+    - explicit conversation_id → load it (404 if missing)
+    - use_latest_conversation=True → pick most recently updated; create if none
+    - otherwise create a new conversation titled from the message
+    """
     if req.conversation_id:
         conv_doc = await db.mercurius_conversations.find_one(
             {"id": req.conversation_id}, {"_id": 0}
         )
         if not conv_doc:
             raise HTTPException(status_code=404, detail="conversation not found")
-        conv = _doc_to_conv(conv_doc)
-    else:
-        # Derive a title from the first message (truncated)
-        title = req.message.strip().split("\n")[0][:60]
-        conv = Conversation(title=title)
-        doc = conv.model_dump()
-        doc["created_at"] = doc["created_at"].isoformat()
-        doc["updated_at"] = doc["updated_at"].isoformat()
-        await db.mercurius_conversations.insert_one(doc)
+        return _doc_to_conv(conv_doc)
+
+    if req.use_latest_conversation:
+        latest = await db.mercurius_conversations.find({}, {"_id": 0}).sort(
+            "updated_at", -1
+        ).limit(1).to_list(1)
+        if latest:
+            return _doc_to_conv(latest[0])
+
+    # Create a new conversation
+    title = req.message.strip().split("\n")[0][:60] or "New thread"
+    conv = Conversation(title=title)
+    doc = conv.model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["updated_at"] = doc["updated_at"].isoformat()
+    await db.mercurius_conversations.insert_one(doc)
+    return conv
+
+
+async def _ensure_corpus():
+    count = await db.mercurius_chunks.count_documents({})
+    if count == 0:
+        await mercurius_corpus.ingest_corpus(db)
+        await mercurius_corpus.reload_cache(db)
+
+
+async def _load_history(conv_id: str, exclude_msg_id: str | None = None) -> List[dict]:
+    query = {"conversation_id": conv_id}
+    if exclude_msg_id:
+        query["id"] = {"$ne": exclude_msg_id}
+    docs = await db.mercurius_messages.find(
+        query, {"_id": 0, "role": 1, "content": 1, "created_at": 1}
+    ).sort("created_at", 1).to_list(2000)
+    return [{"role": d["role"], "content": d["content"]} for d in docs]
+
+
+# --- Chat (non-streaming) --- #
+
+@api_router.post("/mercurius/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest):
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must not be empty")
+
+    await _ensure_corpus()
+    conv = await _resolve_conversation(req)
 
     # Persist user message
     user_msg = Message(conversation_id=conv.id, role="user", content=req.message)
@@ -187,27 +227,21 @@ async def chat_endpoint(req: ChatRequest):
     udoc["created_at"] = udoc["created_at"].isoformat()
     await db.mercurius_messages.insert_one(udoc)
 
-    # Load history (prior messages, excluding the one we just wrote? include all but the one we just wrote will be empty)
-    history_docs = await db.mercurius_messages.find(
-        {"conversation_id": conv.id, "id": {"$ne": user_msg.id}},
-        {"_id": 0, "role": 1, "content": 1, "created_at": 1},
-    ).sort("created_at", 1).to_list(2000)
-    history = [{"role": d["role"], "content": d["content"]} for d in history_docs]
+    history = await _load_history(conv.id, exclude_msg_id=user_msg.id)
 
-    # Retrieve relevant corpus passages
     try:
         passages = await mercurius_corpus.retrieve(db, req.message, k=5)
     except Exception as e:
         logger.error("Retrieval failed: %s", e)
         passages = []
 
-    # Generate assistant response
     try:
         assistant_text = await mercurius_chat.generate_response(
             conversation_id=conv.id,
             user_text=req.message,
             retrieved_passages=passages,
             history=history,
+            camera_context=req.camera_context.model_dump() if req.camera_context else None,
         )
     except Exception as e:
         logger.exception("Mercurius generation failed")
@@ -229,6 +263,107 @@ async def chat_endpoint(req: ChatRequest):
         conversation_id=conv.id,
         assistant_message=assistant_msg,
         passages=[RetrievedPassage(**p) for p in passages],
+    )
+
+
+# --- Chat (streaming, SSE) --- #
+
+@api_router.post("/mercurius/chat/stream")
+async def chat_stream_endpoint(req: ChatRequest):
+    """Server-Sent Events stream of Mercurius's reply.
+
+    Event format (each line a separate event):
+        data: {"type":"meta","conversation_id":"...","assistant_message_id":"...","passages":[...]}
+        data: {"type":"token","content":"..."}     (many of these)
+        data: {"type":"done","content":"<full text>"}
+        data: {"type":"error","message":"..."}     (on failure)
+    """
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="message must not be empty")
+
+    await _ensure_corpus()
+    conv = await _resolve_conversation(req)
+
+    # Persist user message immediately so refreshes / reconnects see it
+    user_msg = Message(conversation_id=conv.id, role="user", content=req.message)
+    udoc = user_msg.model_dump()
+    udoc["created_at"] = udoc["created_at"].isoformat()
+    await db.mercurius_messages.insert_one(udoc)
+
+    history = await _load_history(conv.id, exclude_msg_id=user_msg.id)
+
+    try:
+        passages = await mercurius_corpus.retrieve(db, req.message, k=5)
+    except Exception as e:
+        logger.error("Retrieval failed: %s", e)
+        passages = []
+
+    # Pre-create assistant message ID so the client can reference it
+    assistant_msg = Message(conversation_id=conv.id, role="assistant", content="")
+
+    camera_dict = req.camera_context.model_dump() if req.camera_context else None
+
+    async def event_gen():
+        # Initial meta event
+        meta = {
+            "type": "meta",
+            "conversation_id": conv.id,
+            "user_message_id": user_msg.id,
+            "assistant_message_id": assistant_msg.id,
+            "passages": [
+                {
+                    "doc_title": p["doc_title"],
+                    "section": p.get("section", ""),
+                    "text": p["text"],
+                    "score": p["score"],
+                }
+                for p in passages
+            ],
+        }
+        yield f"data: {json.dumps(meta)}\n\n"
+
+        accumulated_parts: List[str] = []
+        try:
+            async for token in mercurius_chat.generate_response_stream(
+                user_text=req.message,
+                retrieved_passages=passages,
+                history=history,
+                camera_context=camera_dict,
+            ):
+                accumulated_parts.append(token)
+                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+        except Exception as e:
+            logger.exception("Stream generation failed")
+            err = {"type": "error", "message": str(e)}
+            yield f"data: {json.dumps(err)}\n\n"
+            return
+
+        full_text = "".join(accumulated_parts)
+        # Persist assistant message + bump conversation timestamp
+        try:
+            assistant_msg.content = full_text
+            adoc = assistant_msg.model_dump()
+            adoc["created_at"] = adoc["created_at"].isoformat()
+            await db.mercurius_messages.insert_one(adoc)
+            await db.mercurius_conversations.update_one(
+                {"id": conv.id},
+                {"$set": {"updated_at": datetime.now(timezone.utc).isoformat()}},
+            )
+        except Exception as e:
+            logger.exception("Failed to persist assistant message")
+            yield f"data: {json.dumps({'type': 'error', 'message': f'persist failed: {e}'})}\n\n"
+            return
+
+        yield f"data: {json.dumps({'type': 'done', 'content': full_text})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable buffering for nginx-style proxies
+            "Connection": "keep-alive",
+        },
     )
 
 

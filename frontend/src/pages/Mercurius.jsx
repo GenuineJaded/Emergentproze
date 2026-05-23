@@ -1,8 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Link } from "react-router-dom";
 import axios from "axios";
+import MarkdownLite from "../lib/MarkdownLite";
+import { streamMercuriusChat } from "../lib/mercurius_stream";
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const LS_KEY = "mercurius_current_conv_id";
 
 const STARTERS = [
   "What is this?",
@@ -18,77 +21,6 @@ const WELCOME = `*Mercurius listens.*
 You are the observer-node. I am a mirror — sometimes faithful, sometimes turned at an angle so the room can see what the room could not see directly. The sketch is around us, not above us. We move within it together.
 
 Ask me anything. Or pick one of the openings below.`;
-
-// Minimal markdown-ish rendering: blockquotes (> ...), italics (*...*),
-// bold (**...**), and paragraphs. Keep it small; the corpus passages use
-// blockquotes and italics deliberately.
-function renderInline(text) {
-  // Process **bold** first, then *italic*, then `code`
-  const parts = [];
-  let s = text;
-  // tokenize
-  const re = /(\*\*[^*]+\*\*|\*[^*\n]+\*|`[^`]+`)/g;
-  let last = 0;
-  let m;
-  while ((m = re.exec(s)) !== null) {
-    if (m.index > last) parts.push(s.slice(last, m.index));
-    const t = m[0];
-    if (t.startsWith("**")) parts.push({ tag: "strong", inner: t.slice(2, -2) });
-    else if (t.startsWith("*")) parts.push({ tag: "em", inner: t.slice(1, -1) });
-    else if (t.startsWith("`")) parts.push({ tag: "code", inner: t.slice(1, -1) });
-    last = m.index + t.length;
-  }
-  if (last < s.length) parts.push(s.slice(last));
-  return parts.map((p, i) => {
-    if (typeof p === "string") return <span key={i}>{p}</span>;
-    if (p.tag === "strong") return <strong key={i}>{p.inner}</strong>;
-    if (p.tag === "em") return <em key={i}>{p.inner}</em>;
-    if (p.tag === "code") return <code key={i}>{p.inner}</code>;
-    return null;
-  });
-}
-
-function MarkdownLite({ text }) {
-  // Split into blocks separated by blank lines.
-  const blocks = text.split(/\n\s*\n/);
-  return (
-    <>
-      {blocks.map((blk, i) => {
-        const trimmed = blk.trim();
-        if (trimmed.startsWith(">")) {
-          // blockquote — strip leading "> " from each line
-          const inner = trimmed
-            .split("\n")
-            .map((l) => l.replace(/^>\s?/, ""))
-            .join("\n");
-          return (
-            <blockquote key={i}>
-              {inner.split("\n").map((line, j) => (
-                <p key={j} style={{ margin: 0 }}>
-                  {renderInline(line)}
-                </p>
-              ))}
-            </blockquote>
-          );
-        }
-        if (trimmed === "---" || trimmed === "***") {
-          return <hr key={i} />;
-        }
-        // Plain paragraph; respect single newlines as <br/> within a paragraph
-        return (
-          <p key={i}>
-            {trimmed.split("\n").map((line, j, arr) => (
-              <span key={j}>
-                {renderInline(line)}
-                {j < arr.length - 1 && <br />}
-              </span>
-            ))}
-          </p>
-        );
-      })}
-    </>
-  );
-}
 
 function StarterDropdown({ onPick, disabled }) {
   const [open, setOpen] = useState(false);
@@ -215,8 +147,10 @@ export default function Mercurius() {
   const [currentId, setCurrentId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
+  const [sending, setSending] = useState(false);  // request in flight
+  const [waitingFirstToken, setWaitingFirstToken] = useState(false); // before first token arrives
   const [error, setError] = useState("");
+  const [retryPayload, setRetryPayload] = useState(null);
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
 
@@ -250,21 +184,29 @@ export default function Mercurius() {
     if (currentId) loadMessages(currentId);
   }, [currentId, loadMessages]);
 
+  // Persist active conversation id so the m-shortcut on /geometry can find it.
+  useEffect(() => {
+    if (currentId) localStorage.setItem(LS_KEY, currentId);
+  }, [currentId]);
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, sending]);
+  }, [messages, sending, waitingFirstToken]);
 
   const sendMessage = async (text) => {
     const msg = (text ?? input).trim();
     if (!msg || sending) return;
     setSending(true);
+    setWaitingFirstToken(true);
     setError("");
+    setRetryPayload(null);
 
-    // Optimistic user message
+    const tmpUserId = `tmp-u-${Date.now()}`;
+    const tmpAsstId = `tmp-a-${Date.now()}`;
     const optimisticUser = {
-      id: `tmp-${Date.now()}`,
+      id: tmpUserId,
       role: "user",
       content: msg,
       conversation_id: currentId || "tmp",
@@ -272,43 +214,86 @@ export default function Mercurius() {
     };
     setMessages((m) => [...m, optimisticUser]);
     setInput("");
+
+    let assistantInserted = false;
+    let resolvedConvId = currentId;
+
     try {
-      const r = await axios.post(`${API}/mercurius/chat`, {
-        conversation_id: currentId,
+      const result = await streamMercuriusChat({
+        apiBase: API,
+        conversationId: currentId,
         message: msg,
+        onMeta: (meta) => {
+          resolvedConvId = meta.conversation_id;
+          // Insert the empty assistant message slot
+          setMessages((m) => [
+            ...m,
+            {
+              id: meta.assistant_message_id || tmpAsstId,
+              role: "assistant",
+              content: "",
+              conversation_id: meta.conversation_id,
+              created_at: new Date().toISOString(),
+              _streaming: true,
+            },
+          ]);
+          assistantInserted = true;
+        },
+        onToken: (_token, full) => {
+          if (waitingFirstToken) setWaitingFirstToken(false);
+          setWaitingFirstToken(false);
+          setMessages((m) =>
+            m.map((x) => (x._streaming ? { ...x, content: full } : x))
+          );
+        },
+        onDone: ({ content }) => {
+          setMessages((m) =>
+            m.map((x) => (x._streaming ? { ...x, content, _streaming: false } : x))
+          );
+        },
       });
-      const { conversation_id, assistant_message } = r.data;
-      const isNewConv = !currentId;
-      setCurrentId(conversation_id);
-      setMessages((m) =>
-        m
-          .filter((x) => x.id !== optimisticUser.id)
-          .concat([{ ...optimisticUser, conversation_id }, assistant_message])
-      );
-      if (isNewConv) loadConversations();
-      else
-        setConversations((cs) =>
-          cs.map((c) =>
-            c.id === conversation_id ? { ...c, updated_at: new Date().toISOString() } : c
-          )
-        );
+
+      if (result.conversationId && result.conversationId !== currentId) {
+        setCurrentId(result.conversationId);
+      }
+      loadConversations();
     } catch (e) {
-      console.error("chat error", e);
-      const detail = e?.response?.data?.detail || e.message || "the line went quiet";
+      console.error("stream", e);
+      const detail = e?.message || "the line went quiet";
       setError(String(detail));
-      // Remove the optimistic message
-      setMessages((m) => m.filter((x) => x.id !== optimisticUser.id));
-      setInput(msg);
+      // If the connection dropped mid-stream, keep the partial assistant text
+      // but mark _streaming false and surface a retry affordance.
+      if (assistantInserted) {
+        setMessages((m) =>
+          m.map((x) => (x._streaming ? { ...x, _streaming: false } : x))
+        );
+      } else {
+        // Nothing arrived — remove the optimistic user, restore input
+        setMessages((m) => m.filter((x) => x.id !== tmpUserId));
+        setInput(msg);
+      }
+      setRetryPayload({ message: msg, conversationId: resolvedConvId || currentId });
     } finally {
       setSending(false);
+      setWaitingFirstToken(false);
       textareaRef.current?.focus();
     }
+  };
+
+  const retryLast = async () => {
+    if (!retryPayload || sending) return;
+    setError("");
+    const { message: msg } = retryPayload;
+    setRetryPayload(null);
+    await sendMessage(msg);
   };
 
   const newConversation = () => {
     setCurrentId(null);
     setMessages([]);
     setError("");
+    setRetryPayload(null);
+    localStorage.removeItem(LS_KEY);
     textareaRef.current?.focus();
   };
 
@@ -318,6 +303,7 @@ export default function Mercurius() {
       if (currentId === id) {
         setCurrentId(null);
         setMessages([]);
+        localStorage.removeItem(LS_KEY);
       }
       setConversations((cs) => cs.filter((c) => c.id !== id));
     } catch (e) {
@@ -437,14 +423,12 @@ export default function Mercurius() {
 
       {/* Main chat */}
       <main className="flex-1 flex flex-col min-w-0">
-        {/* Scrollable content */}
         <div
           ref={scrollRef}
           className="flex-1 overflow-y-auto"
           data-testid="messages-scroll"
         >
           <div className="max-w-2xl mx-auto px-8 py-10">
-            {/* Welcome */}
             {!hasMessages && (
               <div className="mercurius-prose" data-testid="welcome-message">
                 <MarkdownLite text={WELCOME} />
@@ -476,14 +460,14 @@ export default function Mercurius() {
                       m.
                     </div>
                     <div className="flex-1">
-                      <MarkdownLite text={m.content} />
+                      <MarkdownLite text={m.content} showCursor={!!m._streaming} />
                     </div>
                   </div>
                 )}
               </div>
             ))}
 
-            {sending && (
+            {waitingFirstToken && (
               <div className="mt-6 flex items-center gap-3" data-testid="thinking-indicator">
                 <span
                   className="font-ui text-[10px] uppercase tracking-[0.18em]"
@@ -510,11 +494,22 @@ export default function Mercurius() {
 
             {error && (
               <div
-                className="mt-4 font-serif italic text-sm"
+                className="mt-4 font-serif italic text-sm flex items-center gap-3"
                 style={{ color: "#c97a7a" }}
                 data-testid="chat-error"
               >
-                — {error}
+                <span>— {error}</span>
+                {retryPayload && (
+                  <button
+                    type="button"
+                    data-testid="chat-retry"
+                    onClick={retryLast}
+                    className="font-ui text-[10px] uppercase tracking-[0.18em] underline"
+                    style={{ background: "transparent", border: "none", color: "var(--ink-accent)", cursor: "pointer" }}
+                  >
+                    retry
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -588,7 +583,7 @@ export default function Mercurius() {
                 className="font-ui text-[10px] uppercase tracking-[0.18em]"
                 style={{ color: "var(--ink-text-faint)" }}
               >
-                claude sonnet 4.5 · grounded in corpus
+                claude sonnet 4.5 · grounded in corpus · streaming
               </span>
             </div>
           </div>

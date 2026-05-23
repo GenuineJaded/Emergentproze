@@ -1,13 +1,16 @@
-import { useRef, useState, useEffect, Suspense } from "react";
+import { useRef, useState, useEffect, useCallback, Suspense } from "react";
 import { Link } from "react-router-dom";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls, Html } from "@react-three/drei";
 import * as THREE from "three";
+import { streamMercuriusChat } from "../lib/mercurius_stream";
+import { computeCameraView } from "../lib/camera";
+import MarkdownLite from "../lib/MarkdownLite";
 
-// ---------------- Bicone geometry ----------------
-// Two cones glued base-to-base. ConeGeometry's apex is at +height/2 along Y by
-// default. We build them as a single BufferGeometry shaped manually so the
-// equator is a clean ring at y=0.
+const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const LS_KEY = "mercurius_current_conv_id";
+
+// ---------------- Bicone geometry ---------------- //
 
 function makeBiconeGeometry(radius = 1.4, height = 1.6, segments = 96) {
   const geom = new THREE.BufferGeometry();
@@ -23,27 +26,19 @@ function makeBiconeGeometry(radius = 1.4, height = 1.6, segments = 96) {
     const p0 = new THREE.Vector3(Math.cos(a0) * radius, 0, Math.sin(a0) * radius);
     const p1 = new THREE.Vector3(Math.cos(a1) * radius, 0, Math.sin(a1) * radius);
 
-    // Upper cone triangle: top, p1, p0  (outward winding)
-    positions.push(top.x, top.y, top.z);
-    positions.push(p1.x, p1.y, p1.z);
-    positions.push(p0.x, p0.y, p0.z);
+    positions.push(top.x, top.y, top.z, p1.x, p1.y, p1.z, p0.x, p0.y, p0.z);
     const n_upper = new THREE.Vector3()
       .subVectors(p1, top)
       .cross(new THREE.Vector3().subVectors(p0, top))
       .normalize();
-    for (let k = 0; k < 3; k++)
-      normals.push(n_upper.x, n_upper.y, n_upper.z);
+    for (let k = 0; k < 3; k++) normals.push(n_upper.x, n_upper.y, n_upper.z);
 
-    // Lower cone triangle: bottom, p0, p1
-    positions.push(bottom.x, bottom.y, bottom.z);
-    positions.push(p0.x, p0.y, p0.z);
-    positions.push(p1.x, p1.y, p1.z);
+    positions.push(bottom.x, bottom.y, bottom.z, p0.x, p0.y, p0.z, p1.x, p1.y, p1.z);
     const n_lower = new THREE.Vector3()
       .subVectors(p0, bottom)
       .cross(new THREE.Vector3().subVectors(p1, bottom))
       .normalize();
-    for (let k = 0; k < 3; k++)
-      normals.push(n_lower.x, n_lower.y, n_lower.z);
+    for (let k = 0; k < 3; k++) normals.push(n_lower.x, n_lower.y, n_lower.z);
   }
 
   geom.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
@@ -51,7 +46,6 @@ function makeBiconeGeometry(radius = 1.4, height = 1.6, segments = 96) {
   return geom;
 }
 
-// Equator ring outline
 function EquatorRing({ radius = 1.4, color = "#c8a26b" }) {
   const geometry = useState(() => {
     const points = [];
@@ -73,7 +67,6 @@ function EquatorRing({ radius = 1.4, color = "#c8a26b" }) {
   return <primitive object={new THREE.Line(geometry, material)} />;
 }
 
-// Vertical axis line through poles
 function PolarAxis({ height = 1.6 }) {
   const geometry = useState(() => {
     const points = [
@@ -93,21 +86,18 @@ function PolarAxis({ height = 1.6 }) {
   return <primitive object={new THREE.Line(geometry, material)} />;
 }
 
-// Bicone with vertical-gradient surface (warmer near top pole, cooler near bottom)
 function BiconeSurface({ radius = 1.4, height = 1.6 }) {
   const meshRef = useRef();
   const geometry = useState(() => makeBiconeGeometry(radius, height, 96))[0];
 
-  // Vertical-gradient shader-like material via vertex color trick:
-  // Use a standard physical-ish material with vertexColors.
   useEffect(() => {
     const pos = geometry.attributes.position;
     const colors = new Float32Array(pos.count * 3);
-    const top = new THREE.Color("#d8b27b"); // warm
-    const bottom = new THREE.Color("#4f6a85"); // cool
+    const top = new THREE.Color("#d8b27b");
+    const bottom = new THREE.Color("#4f6a85");
     for (let i = 0; i < pos.count; i++) {
       const y = pos.getY(i);
-      const t = (y + height) / (2 * height); // 0..1
+      const t = (y + height) / (2 * height);
       const c = bottom.clone().lerp(top, t);
       colors[i * 3] = c.r;
       colors[i * 3 + 1] = c.g;
@@ -131,20 +121,13 @@ function BiconeSurface({ radius = 1.4, height = 1.6 }) {
           flatShading
         />
       </mesh>
-      {/* Wireframe overlay */}
       <mesh geometry={geometry}>
-        <meshBasicMaterial
-          color="#8a7e63"
-          wireframe
-          transparent
-          opacity={0.18}
-        />
+        <meshBasicMaterial color="#8a7e63" wireframe transparent opacity={0.18} />
       </mesh>
     </>
   );
 }
 
-// A labeled node — small sphere + HTML billboard
 function Node({ position, color, label, sub, testId, accent = false }) {
   return (
     <group position={position}>
@@ -204,15 +187,12 @@ function Node({ position, color, label, sub, testId, accent = false }) {
   );
 }
 
-// Ambient breathing rotation, paused on user interaction.
 function BreathingRotation({ groupRef, idleRef }) {
   useFrame((_, dt) => {
     if (!groupRef.current) return;
     const now = performance.now();
     const sinceInteract = now - idleRef.current.lastInteract;
-    // resume after 2.5s of idle
     if (sinceInteract > 2500) {
-      // 60s per revolution => 2π / 60 rad/s
       groupRef.current.rotation.y += dt * ((Math.PI * 2) / 60);
     }
   });
@@ -239,7 +219,16 @@ function InteractionWatcher({ idleRef, onFirstInteract }) {
   return null;
 }
 
-function Scene({ idleRef, onFirstInteract }) {
+// Updates a ref with the current camera azimuth/elevation/region every frame.
+function CameraTracker({ cameraStateRef }) {
+  const { camera } = useThree();
+  useFrame(() => {
+    cameraStateRef.current = computeCameraView(camera.position);
+  });
+  return null;
+}
+
+function Scene({ idleRef, onFirstInteract, cameraStateRef }) {
   const groupRef = useRef();
   const radius = 1.4;
   const height = 1.6;
@@ -250,57 +239,18 @@ function Scene({ idleRef, onFirstInteract }) {
       <directionalLight position={[-3, -2, -4]} intensity={0.35} color="#6e8cab" />
 
       <InteractionWatcher idleRef={idleRef} onFirstInteract={onFirstInteract} />
+      <CameraTracker cameraStateRef={cameraStateRef} />
 
       <group ref={groupRef}>
         <BiconeSurface radius={radius} height={height} />
         <EquatorRing radius={radius} />
         <PolarAxis height={height} />
 
-        {/* Top pole: Light */}
-        <Node
-          position={[0, height, 0]}
-          color="#e8c585"
-          label="Light"
-          sub="visible · articulated · conscious"
-          testId="node-light"
-        />
-
-        {/* Bottom pole: Dark */}
-        <Node
-          position={[0, -height, 0]}
-          color="#5a7aa0"
-          label="Dark"
-          sub="hidden · latent · subconscious"
-          testId="node-dark"
-        />
-
-        {/* Equator front: π / Paradox */}
-        <Node
-          position={[radius, 0, 0]}
-          color="#c8a26b"
-          label="π · Paradox"
-          sub="where linear meets circular"
-          accent
-          testId="node-pi"
-        />
-
-        {/* Upper tip-adjacent: Inversion access */}
-        <Node
-          position={[0.15, height * 0.82, 0.15]}
-          color="#b89870"
-          label="Inversion access"
-          sub="hidden presses into surface"
-          testId="node-inversion"
-        />
-
-        {/* Middle interior: Lived Actuality */}
-        <Node
-          position={[0.0, 0.0, -0.35]}
-          color="#a8a194"
-          label="Lived Actuality"
-          sub="where Ground · Love · Change tension"
-          testId="node-lived-actuality"
-        />
+        <Node position={[0, height, 0]} color="#e8c585" label="Light" sub="visible · articulated · conscious" testId="node-light" />
+        <Node position={[0, -height, 0]} color="#5a7aa0" label="Dark" sub="hidden · latent · subconscious" testId="node-dark" />
+        <Node position={[radius, 0, 0]} color="#c8a26b" label="π · Paradox" sub="where linear meets circular" accent testId="node-pi" />
+        <Node position={[0.15, height * 0.82, 0.15]} color="#b89870" label="Inversion access" sub="hidden presses into surface" testId="node-inversion" />
+        <Node position={[0.0, 0.0, -0.35]} color="#a8a194" label="Lived Actuality" sub="where Ground · Love · Change tension" testId="node-lived-actuality" />
       </group>
 
       <BreathingRotation groupRef={groupRef} idleRef={idleRef} />
@@ -318,13 +268,374 @@ function Scene({ idleRef, onFirstInteract }) {
   );
 }
 
+// ---------------- Floating Mercurius panel ---------------- //
+
+function MercuriusPanel({ open, onClose, cameraStateRef }) {
+  const [exchanges, setExchanges] = useState([]); // [{user, assistant, _streaming, _camera}]
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [waitingFirstToken, setWaitingFirstToken] = useState(false);
+  const [error, setError] = useState("");
+  const [retryPayload, setRetryPayload] = useState(null);
+  const panelRef = useRef(null);
+  const inputRef = useRef(null);
+  const scrollRef = useRef(null);
+
+  // Focus input on open
+  useEffect(() => {
+    if (open) {
+      // tiny delay so transition lands
+      const t = setTimeout(() => inputRef.current?.focus(), 60);
+      return () => clearTimeout(t);
+    }
+  }, [open]);
+
+  // Esc + click-outside
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    const onDoc = (e) => {
+      if (panelRef.current && !panelRef.current.contains(e.target)) {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    // mousedown so we don't close on the same click that triggered something inside
+    document.addEventListener("mousedown", onDoc);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDoc);
+    };
+  }, [open, onClose]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [exchanges, waitingFirstToken]);
+
+  const send = async (text) => {
+    const msg = (text ?? input).trim();
+    if (!msg || sending) return;
+    setSending(true);
+    setWaitingFirstToken(true);
+    setError("");
+    setRetryPayload(null);
+
+    const cam = cameraStateRef.current
+      ? {
+          azimuth: cameraStateRef.current.azimuth,
+          elevation: cameraStateRef.current.elevation,
+          region: cameraStateRef.current.region,
+        }
+      : null;
+
+    const exId = `ex-${Date.now()}`;
+    setExchanges((xs) => [
+      ...xs,
+      { id: exId, user: msg, assistant: "", _streaming: true, _camera: cam },
+    ]);
+    setInput("");
+
+    // Use the conversation thread the user has currently open in /mercurius
+    // (persisted in localStorage). If none, use the latest one server-side.
+    const convId = localStorage.getItem(LS_KEY) || null;
+
+    let convIdResolved = convId;
+    let assistantInserted = false;
+    try {
+      await streamMercuriusChat({
+        apiBase: API,
+        conversationId: convId,
+        message: msg,
+        cameraContext: cam,
+        useLatestConversation: !convId,
+        onMeta: (meta) => {
+          convIdResolved = meta.conversation_id;
+          assistantInserted = true;
+        },
+        onToken: (_t, full) => {
+          if (waitingFirstToken) setWaitingFirstToken(false);
+          setWaitingFirstToken(false);
+          setExchanges((xs) =>
+            xs.map((x) => (x.id === exId ? { ...x, assistant: full } : x))
+          );
+        },
+        onDone: ({ content }) => {
+          setExchanges((xs) =>
+            xs.map((x) =>
+              x.id === exId ? { ...x, assistant: content, _streaming: false } : x
+            )
+          );
+        },
+      });
+
+      if (convIdResolved) {
+        localStorage.setItem(LS_KEY, convIdResolved);
+      }
+    } catch (e) {
+      console.error("panel stream", e);
+      setError(String(e.message || e));
+      if (assistantInserted) {
+        setExchanges((xs) =>
+          xs.map((x) => (x.id === exId ? { ...x, _streaming: false } : x))
+        );
+      } else {
+        setExchanges((xs) => xs.filter((x) => x.id !== exId));
+        setInput(msg);
+      }
+      setRetryPayload({ message: msg });
+    } finally {
+      setSending(false);
+      setWaitingFirstToken(false);
+      inputRef.current?.focus();
+    }
+  };
+
+  const onKey = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
+
+  if (!open) return null;
+
+  return (
+    <div
+      ref={panelRef}
+      data-testid="geometry-mercurius-panel"
+      className="absolute"
+      style={{
+        bottom: 80,
+        right: 20,
+        width: 380,
+        maxHeight: "70vh",
+        display: "flex",
+        flexDirection: "column",
+        background: "rgba(13,17,23,0.92)",
+        backdropFilter: "blur(14px)",
+        border: "1px solid rgba(200,162,107,0.28)",
+        borderRadius: 6,
+        boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
+        color: "var(--ink-text)",
+        zIndex: 50,
+      }}
+    >
+      {/* Header */}
+      <div
+        className="flex items-center justify-between px-4 py-3"
+        style={{ borderBottom: "1px solid var(--ink-rule-soft)" }}
+      >
+        <div className="flex items-center gap-2">
+          <span
+            className="font-ui text-[10px] uppercase tracking-[0.18em]"
+            style={{ color: "var(--ink-accent)" }}
+          >
+            m.
+          </span>
+          <span
+            className="font-serif italic text-sm"
+            style={{ color: "var(--ink-text-dim)" }}
+          >
+            from where you stand
+          </span>
+        </div>
+        <button
+          type="button"
+          data-testid="panel-close"
+          onClick={onClose}
+          className="font-ui text-[10px] uppercase tracking-[0.18em] transition-colors duration-200"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: "var(--ink-text-faint)",
+            cursor: "pointer",
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--ink-text)")}
+          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--ink-text-faint)")}
+          title="Esc to close"
+        >
+          esc
+        </button>
+      </div>
+
+      {/* Scrollable chat history (this session only) */}
+      <div
+        ref={scrollRef}
+        className="overflow-y-auto px-4 py-3"
+        style={{ flex: 1, minHeight: 80 }}
+      >
+        {exchanges.length === 0 && (
+          <div
+            className="font-serif italic text-sm"
+            style={{ color: "var(--ink-text-faint)" }}
+          >
+            ask from the angle you're holding. mercurius will hear the camera too.
+          </div>
+        )}
+        {exchanges.map((ex) => (
+          <div key={ex.id} className="mb-4">
+            <div className="user-prose mb-2" style={{ fontSize: 14 }}>
+              <span
+                className="font-ui text-[10px] uppercase tracking-[0.18em] mr-2"
+                style={{ color: "var(--ink-text-faint)" }}
+              >
+                you
+              </span>
+              {ex.user}
+            </div>
+            {ex._camera && (
+              <div
+                className="font-ui text-[10px] mb-2"
+                style={{ color: "var(--ink-text-faint)", letterSpacing: "0.06em" }}
+              >
+                · az {Math.round(ex._camera.azimuth)}° · el {Math.round(ex._camera.elevation)}° · {ex._camera.region}
+              </div>
+            )}
+            {(ex.assistant || ex._streaming) && (
+              <div className="mercurius-prose" style={{ fontSize: 14 }}>
+                <MarkdownLite text={ex.assistant} showCursor={!!ex._streaming} />
+              </div>
+            )}
+          </div>
+        ))}
+        {waitingFirstToken && (
+          <div className="flex items-center gap-2" data-testid="panel-thinking">
+            <span
+              className="font-ui text-[10px] uppercase tracking-[0.18em]"
+              style={{ color: "var(--ink-accent)" }}
+            >
+              m.
+            </span>
+            <span
+              className="breath-dot inline-block rounded-full"
+              style={{ width: 5, height: 5, background: "var(--ink-accent)" }}
+            />
+            <span
+              className="font-serif italic text-xs"
+              style={{ color: "var(--ink-text-faint)" }}
+            >
+              listening
+            </span>
+          </div>
+        )}
+        {error && (
+          <div
+            className="mt-2 font-serif italic text-xs flex items-center gap-3"
+            style={{ color: "#c97a7a" }}
+            data-testid="panel-error"
+          >
+            <span>— {error}</span>
+            {retryPayload && (
+              <button
+                type="button"
+                data-testid="panel-retry"
+                onClick={() => send(retryPayload.message)}
+                className="font-ui text-[10px] uppercase tracking-[0.18em] underline"
+                style={{ background: "transparent", border: "none", color: "var(--ink-accent)", cursor: "pointer" }}
+              >
+                retry
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Input */}
+      <div className="px-3 pb-3 pt-2" style={{ borderTop: "1px solid var(--ink-rule-soft)" }}>
+        <textarea
+          ref={inputRef}
+          data-testid="panel-input"
+          rows={1}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={onKey}
+          placeholder="speak"
+          disabled={sending}
+          className="font-serif w-full resize-none"
+          style={{
+            background: "var(--ink-bg-2)",
+            color: "var(--ink-text)",
+            border: "1px solid var(--ink-rule)",
+            borderRadius: 3,
+            padding: "8px 10px",
+            fontSize: 15,
+            lineHeight: 1.45,
+            outline: "none",
+            minHeight: 38,
+            maxHeight: 120,
+          }}
+          onInput={(e) => {
+            e.currentTarget.style.height = "auto";
+            e.currentTarget.style.height =
+              Math.min(e.currentTarget.scrollHeight, 120) + "px";
+          }}
+        />
+        <div className="flex justify-between items-center mt-2">
+          <span
+            className="font-ui text-[10px] uppercase tracking-[0.18em]"
+            style={{ color: "var(--ink-text-faint)" }}
+          >
+            enter to send · esc to close
+          </span>
+          <button
+            type="button"
+            data-testid="panel-send"
+            onClick={() => send()}
+            disabled={sending || !input.trim()}
+            className="font-ui text-[10px] uppercase tracking-[0.18em] transition-colors duration-200"
+            style={{
+              padding: "5px 12px",
+              background: input.trim() && !sending ? "var(--ink-accent)" : "transparent",
+              color: input.trim() && !sending ? "var(--ink-bg)" : "var(--ink-text-faint)",
+              border: `1px solid ${input.trim() && !sending ? "var(--ink-accent)" : "var(--ink-rule)"}`,
+              borderRadius: 3,
+              cursor: sending || !input.trim() ? "default" : "pointer",
+              opacity: sending ? 0.5 : 1,
+            }}
+          >
+            send
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Geometry page ---------------- //
+
 export default function Geometry() {
   const idleRef = useRef({ lastInteract: 0 });
+  const cameraStateRef = useRef({ azimuth: 0, elevation: 0, region: "Equator" });
   const [hasInteracted, setHasInteracted] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(false);
 
-  const onFirstInteract = () => {
-    if (!hasInteracted) setHasInteracted(true);
-  };
+  const onFirstInteract = useCallback(() => {
+    setHasInteracted((v) => v || true);
+  }, []);
+
+  // Global `m` key opens the panel (unless user is typing in an input)
+  useEffect(() => {
+    const onKey = (e) => {
+      const tag = (e.target?.tagName || "").toLowerCase();
+      const inField = tag === "input" || tag === "textarea" || e.target?.isContentEditable;
+      if (inField) return;
+      if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        setPanelOpen((v) => !v);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const closePanel = useCallback(() => setPanelOpen(false), []);
 
   return (
     <div
@@ -338,11 +649,16 @@ export default function Geometry() {
         onCreated={({ gl, camera }) => {
           gl.setClearColor("#0d1117", 1);
           camera.lookAt(0, 0.1, 0);
+          cameraStateRef.current = computeCameraView(camera.position);
         }}
         dpr={[1, 2]}
       >
         <Suspense fallback={null}>
-          <Scene idleRef={idleRef} onFirstInteract={onFirstInteract} />
+          <Scene
+            idleRef={idleRef}
+            onFirstInteract={onFirstInteract}
+            cameraStateRef={cameraStateRef}
+          />
         </Suspense>
       </Canvas>
 
@@ -381,14 +697,24 @@ export default function Geometry() {
         orbit to change what this is
       </div>
 
-      {/* Bottom-right: legend of failure-modes hint */}
+      {/* Bottom-right legend + m-hint */}
       <div
         className="absolute bottom-10 right-8 font-ui text-[10px] uppercase tracking-[0.2em] text-right pointer-events-none"
         style={{ color: "var(--ink-text-faint)" }}
       >
         <div>look down the axis · circle</div>
         <div className="mt-1">look across the equator · diamond</div>
+        <div className="mt-3" style={{ color: "var(--ink-accent)" }}>
+          press <span style={{ fontFamily: "Inter Tight, monospace" }}>m</span> · ask from here
+        </div>
       </div>
+
+      {/* Floating Mercurius panel */}
+      <MercuriusPanel
+        open={panelOpen}
+        onClose={closePanel}
+        cameraStateRef={cameraStateRef}
+      />
     </div>
   );
 }

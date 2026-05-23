@@ -1,7 +1,7 @@
 # Mercurius / The Living Sketch — PRD
 
 ## Status
-**Phase 0 — Proof of Concept.** Single-user contemplative instrument. Two risky pieces validated independently before any further build.
+**Phase 1 (compressed) — `m`-shortcut + streaming added.** Voice tuned. Single-user contemplative instrument.
 
 ## Original problem statement (verbatim, condensed)
 > Phase 0 is a **proof-of-concept** isolating the two risky pieces. Do not build the full atlas yet. Do not build full polish. Build just enough to prove these two things work:

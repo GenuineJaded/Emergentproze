@@ -150,3 +150,16 @@ body {
     50% { opacity: 1; transform: scale(1.06); }
 }
 .breath-dot { animation: breath 1.8s ease-in-out infinite; }
+
+/* streaming caret — appended to the last paragraph while tokens arrive */
+@keyframes stream-blink {
+    0%, 60% { opacity: 0.9; }
+    61%, 100% { opacity: 0; }
+}
+.stream-caret {
+    display: inline-block;
+    margin-left: 2px;
+    color: var(--ink-accent);
+    font-family: "Inter Tight", monospace;
+    animation: stream-blink 1.05s steps(1) infinite;
+}
