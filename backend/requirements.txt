@@ -28,3 +28,4 @@ emergentintegrations==0.1.0
 numpy==2.4.6
 openai==1.99.9
 python-docx==1.2.0
+rank-bm25==0.2.2

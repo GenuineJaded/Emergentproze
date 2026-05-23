@@ -1,25 +1,24 @@
-"""Corpus ingestion + retrieval for Mercurius.
+"""Corpus ingestion + BM25 retrieval for Mercurius.
 
 - Reads the 6 markdown corpus files from /app/backend/corpus/
-- Chunks them by section + sliding window
-- Embeds each chunk via OpenAI text-embedding-3-small through the Emergent proxy
-- Stores chunks + embeddings in MongoDB (collection: mercurius_chunks)
-- Provides a retrieve(query, k) function that returns top-k chunks by cosine similarity
+- Chunks them at paragraph level, attaching the nearest preceding section heading
+- Indexes with BM25 (lowercased, lightly stemmed tokens)
+- Stores chunks in MongoDB (collection: mercurius_chunks) — embedding-free
+- Provides retrieve(query, k) returning top-k chunks with original casing
 
-The Emergent universal key (sk-emergent-*) routes through
-https://integrations.emergentagent.com/llm which is an OpenAI-compatible proxy.
+Rationale: the Emergent universal key does not expose embedding models, and the
+corpus vocabulary (bicone, equator, π, persistence, metabolization, inversion,
+ground, love, change, etc.) is sharp enough that BM25 retrieves very accurately
+at this scale (44 chunks across 6 documents).
 """
 from __future__ import annotations
 
-import os
 import re
-import asyncio
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-import numpy as np
-from openai import AsyncOpenAI
+from rank_bm25 import BM25Okapi
 
 logger = logging.getLogger(__name__)
 
@@ -34,76 +33,130 @@ DOC_TITLES = {
     "06_observing_novelty_uniqueness.md": "Observing Novelty and Uniqueness",
 }
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIM = 1536
+# Tiny stopword list — keep it short so distinctive corpus terms always survive
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "at", "by",
+    "for", "with", "as", "is", "are", "was", "were", "be", "been", "being",
+    "it", "its", "this", "that", "these", "those", "i", "you", "we", "they",
+    "he", "she", "him", "her", "them", "us", "our", "their", "your", "my",
+    "me", "do", "does", "did", "have", "has", "had", "will", "would", "could",
+    "should", "can", "may", "might", "must", "shall",
+    "so", "if", "then", "else", "than", "too", "very", "just", "only",
+    "not", "no", "yes", "all", "any", "some", "what", "which", "who", "whom",
+    "whose", "where", "when", "why", "how", "there", "here", "from", "into",
+    "about", "over", "under", "out", "up", "down", "off", "on",
+}
 
 
-def _get_openai_client() -> AsyncOpenAI:
-    key = os.environ["EMERGENT_LLM_KEY"]
-    base_url = os.environ.get(
-        "INTEGRATION_PROXY_URL", "https://integrations.emergentagent.com"
-    ).rstrip("/") + "/llm"
-    return AsyncOpenAI(api_key=key, base_url=base_url)
+def _light_stem(token: str) -> str:
+    """Strip very common English suffixes. Lightweight; preserves stems for
+    distinctive vocabulary (bicone, equator, π stay intact)."""
+    if len(token) <= 4:
+        return token
+    for suf in ("ization", "izations", "isation", "tional", "ations", "ation",
+                "ings", "ness", "ment", "ies", "ed", "es", "ing", "ly", "s"):
+        if token.endswith(suf) and len(token) - len(suf) >= 3:
+            return token[: -len(suf)]
+    return token
 
 
-def _chunk_markdown(text: str, doc_id: str, doc_title: str) -> List[Dict[str, Any]]:
-    """Chunk a markdown document by ### sections, then split long sections into ~600-word windows."""
-    chunks: List[Dict[str, Any]] = []
-    # Split by '### ' headings (subsections); keep heading attached.
-    parts = re.split(r"\n(?=### )", text)
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        # Extract section heading if present
-        heading_match = re.match(r"^(#{1,3})\s+(.+?)(?:\n|$)", part)
-        section = heading_match.group(2).strip() if heading_match else ""
+_TOKEN_RE = re.compile(r"[A-Za-zπ]+(?:'[a-z]+)?", re.UNICODE)
 
-        words = part.split()
-        if len(words) <= 700:
-            chunks.append({"text": part, "section": section})
-        else:
-            # Sliding window: 600 words with 100-word overlap
-            step = 500
-            window = 600
-            i = 0
-            while i < len(words):
-                window_words = words[i : i + window]
-                if not window_words:
-                    break
-                chunk_text = " ".join(window_words)
-                chunks.append({"text": chunk_text, "section": section})
-                i += step
 
+def _tokenize(text: str) -> List[str]:
     out = []
-    for idx, c in enumerate(chunks):
+    for raw in _TOKEN_RE.findall(text.lower()):
+        if raw in STOPWORDS or len(raw) < 2:
+            continue
+        out.append(_light_stem(raw))
+    return out
+
+
+def _split_into_chunks(doc_text: str, doc_id: str, doc_title: str) -> List[Dict[str, Any]]:
+    """Walk the markdown, accumulate paragraphs under the current section heading,
+    then split each section into ~250-450-word chunks (never smaller than ~200,
+    never larger than ~550). Section heading is prepended to every chunk so BM25
+    queries against headings hit body chunks too."""
+    lines = doc_text.split("\n")
+    current_section = ""
+    section_buf: List[str] = []
+
+    def flush() -> List[Dict[str, Any]]:
+        if not section_buf:
+            return []
+        body = "\n".join(section_buf).strip()
+        if not body:
+            return []
+        # Break body into chunks by paragraph; aim for ~350 words/chunk
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+        chunks: List[Dict[str, Any]] = []
+        buf_words = 0
+        buf_paras: List[str] = []
+        for p in paragraphs:
+            w = len(p.split())
+            if buf_words + w > 450 and buf_paras:
+                chunks.append({"section": current_section, "paragraphs": buf_paras})
+                buf_paras = [p]
+                buf_words = w
+            else:
+                buf_paras.append(p)
+                buf_words += w
+        if buf_paras:
+            chunks.append({"section": current_section, "paragraphs": buf_paras})
+        return chunks
+
+    all_chunks: List[Dict[str, Any]] = []
+    for line in lines:
+        m = re.match(r"^(#{1,3})\s+(.+)$", line)
+        if m:
+            # New heading; flush prior section
+            all_chunks.extend(flush())
+            level = len(m.group(1))
+            heading = m.group(2).strip()
+            if level >= 3:
+                current_section = heading
+            elif level == 2:
+                # Subtitle line — fold into section context
+                current_section = heading
+            else:  # level 1 = doc title; reset
+                current_section = ""
+            section_buf = []
+        else:
+            section_buf.append(line)
+    all_chunks.extend(flush())
+
+    # Materialize chunks with section-prefixed text
+    out: List[Dict[str, Any]] = []
+    for idx, c in enumerate(all_chunks):
+        body = "\n\n".join(c["paragraphs"])
+        if c["section"]:
+            full = f"### {c['section']}\n\n{body}"
+        else:
+            full = body
+        # Index text = full chunk; display text preserves original casing
         out.append(
             {
                 "doc_id": doc_id,
                 "doc_title": doc_title,
                 "section": c["section"],
                 "chunk_index": idx,
-                "text": c["text"],
+                "text": full,
             }
         )
     return out
 
 
-async def _embed_batch(client: AsyncOpenAI, texts: List[str]) -> List[List[float]]:
-    response = await client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=texts,
-        encoding_format="float",
-    )
-    return [item.embedding for item in response.data]
+# In-process BM25 index + chunk metadata
+_index: Dict[str, Any] = {"bm25": None, "chunks": [], "ready": False}
+
+
+def _build_bm25(chunks: List[Dict[str, Any]]) -> BM25Okapi:
+    tokenized = [_tokenize(c["text"]) for c in chunks]
+    return BM25Okapi(tokenized)
 
 
 async def ingest_corpus(db) -> Dict[str, Any]:
-    """Idempotent ingestion. Drops & rebuilds mercurius_chunks if corpus changed.
-
-    Returns a summary dict.
-    """
-    # Build chunks from disk
+    """Idempotent: rebuild Mongo collection + in-process BM25 index from disk."""
     all_chunks: List[Dict[str, Any]] = []
     for filename, title in DOC_TITLES.items():
         path = CORPUS_DIR / filename
@@ -112,94 +165,66 @@ async def ingest_corpus(db) -> Dict[str, Any]:
             continue
         text = path.read_text(encoding="utf-8")
         doc_id = filename.replace(".md", "")
-        all_chunks.extend(_chunk_markdown(text, doc_id, title))
+        all_chunks.extend(_split_into_chunks(text, doc_id, title))
 
     if not all_chunks:
         return {"status": "no_corpus_found", "chunks": 0}
 
-    # Check if already ingested with same chunk count
     existing = await db.mercurius_chunks.count_documents({})
-    if existing == len(all_chunks):
+    if existing != len(all_chunks):
+        logger.info("Rebuilding corpus: %d chunks (was %d)", len(all_chunks), existing)
+        await db.mercurius_chunks.drop()
+        await db.mercurius_chunks.insert_many(all_chunks)
+    else:
         logger.info("Corpus already ingested: %d chunks", existing)
-        return {"status": "already_ingested", "chunks": existing}
 
-    # Re-ingest: drop and rebuild
-    logger.info("Ingesting %d chunks (was %d)", len(all_chunks), existing)
-    await db.mercurius_chunks.drop()
-
-    client = _get_openai_client()
-    # Batch embeddings (OpenAI handles up to ~2048 inputs per request; we have <100)
-    texts = [c["text"] for c in all_chunks]
-    batch_size = 32
-    embeddings: List[List[float]] = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        embs = await _embed_batch(client, batch)
-        embeddings.extend(embs)
-        logger.info("Embedded %d/%d chunks", min(i + batch_size, len(texts)), len(texts))
-
-    # Insert
-    docs = []
-    for chunk, emb in zip(all_chunks, embeddings):
-        docs.append({**chunk, "embedding": emb})
-    await db.mercurius_chunks.insert_many(docs)
-    logger.info("Inserted %d chunks into mercurius_chunks", len(docs))
-
-    return {"status": "ingested", "chunks": len(docs)}
-
-
-# In-memory cache of embeddings matrix for fast cosine sim
-_cache: Dict[str, Any] = {"matrix": None, "meta": None, "count": 0}
-
-
-async def _load_cache(db) -> None:
-    docs = await db.mercurius_chunks.find(
-        {}, {"embedding": 1, "text": 1, "doc_id": 1, "doc_title": 1, "section": 1, "_id": 0}
-    ).to_list(length=10_000)
-    if not docs:
-        _cache["matrix"] = None
-        _cache["meta"] = []
-        _cache["count"] = 0
-        return
-    matrix = np.array([d["embedding"] for d in docs], dtype=np.float32)
-    # Normalize for cosine similarity
-    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    matrix = matrix / norms
-    _cache["matrix"] = matrix
-    _cache["meta"] = [
-        {"text": d["text"], "doc_id": d["doc_id"], "doc_title": d["doc_title"], "section": d["section"]}
-        for d in docs
-    ]
-    _cache["count"] = len(docs)
-    logger.info("Loaded embedding cache: %d chunks", len(docs))
-
-
-async def retrieve(db, query: str, k: int = 5) -> List[Dict[str, Any]]:
-    """Embed the query and return top-k chunks by cosine similarity."""
-    if _cache["matrix"] is None or _cache["count"] == 0:
-        await _load_cache(db)
-
-    if _cache["matrix"] is None:
-        return []
-
-    client = _get_openai_client()
-    q_embs = await _embed_batch(client, [query])
-    q = np.array(q_embs[0], dtype=np.float32)
-    q_norm = np.linalg.norm(q)
-    if q_norm == 0:
-        return []
-    q = q / q_norm
-
-    sims = _cache["matrix"] @ q  # cosine similarity (both normalized)
-    top_idx = np.argsort(-sims)[:k]
-    results = []
-    for i in top_idx:
-        meta = _cache["meta"][int(i)]
-        results.append({**meta, "score": float(sims[int(i)])})
-    return results
+    # Build BM25 in process
+    _index["bm25"] = _build_bm25(all_chunks)
+    _index["chunks"] = all_chunks
+    _index["ready"] = True
+    return {"status": "ok", "chunks": len(all_chunks)}
 
 
 async def reload_cache(db) -> None:
-    """Force-reload the in-memory cache (call after ingestion)."""
-    await _load_cache(db)
+    """Reload BM25 index from Mongo (used if a different process ingested)."""
+    docs = await db.mercurius_chunks.find(
+        {}, {"_id": 0, "doc_id": 1, "doc_title": 1, "section": 1, "chunk_index": 1, "text": 1}
+    ).to_list(length=5000)
+    docs.sort(key=lambda d: (d["doc_id"], d["chunk_index"]))
+    if not docs:
+        _index["bm25"] = None
+        _index["chunks"] = []
+        _index["ready"] = False
+        return
+    _index["bm25"] = _build_bm25(docs)
+    _index["chunks"] = docs
+    _index["ready"] = True
+    logger.info("BM25 index loaded: %d chunks", len(docs))
+
+
+async def retrieve(db, query: str, k: int = 5) -> List[Dict[str, Any]]:
+    if not _index["ready"]:
+        await reload_cache(db)
+    if not _index["ready"] or not _index["chunks"]:
+        return []
+    q_tokens = _tokenize(query)
+    if not q_tokens:
+        return []
+    scores = _index["bm25"].get_scores(q_tokens)
+    # Pair with indices, sort, take top-k
+    scored = sorted(enumerate(scores), key=lambda x: -x[1])[:k]
+    results: List[Dict[str, Any]] = []
+    for idx, score in scored:
+        if score <= 0:
+            continue
+        c = _index["chunks"][idx]
+        results.append(
+            {
+                "doc_id": c["doc_id"],
+                "doc_title": c["doc_title"],
+                "section": c["section"],
+                "text": c["text"],
+                "score": float(score),
+            }
+        )
+    return results
