@@ -333,9 +333,12 @@ export default function Geometry() {
       data-testid="geometry-page"
     >
       <Canvas
-        camera={{ position: [3.4, 1.8, 3.4], fov: 38 }}
+        camera={{ position: [3.8, 2.6, 3.8], fov: 38 }}
         gl={{ antialias: true, alpha: false }}
-        onCreated={({ gl }) => gl.setClearColor("#0d1117", 1)}
+        onCreated={({ gl, camera }) => {
+          gl.setClearColor("#0d1117", 1);
+          camera.lookAt(0, 0.1, 0);
+        }}
         dpr={[1, 2]}
       >
         <Suspense fallback={null}>
