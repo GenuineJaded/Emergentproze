@@ -232,12 +232,12 @@ def _find_concept(concept_id: str) -> Dict[str, Any] | None:
     return None
 
 
-async def get_concept_passages(db, concept_id: str, k: int = 3) -> Dict[str, Any] | None:
+def get_concept_passages(concept_id: str, k: int = 3) -> Dict[str, Any] | None:
     """Look up the concept, retrieve top-k corpus passages, return both."""
     meta = _find_concept(concept_id)
     if meta is None:
         return None
-    passages = await mercurius_corpus.retrieve(db, meta["query"], k=k)
+    passages = mercurius_corpus.retrieve(meta["query"], k=k)
     return {
         "id": meta["id"],
         "label": meta["label"],

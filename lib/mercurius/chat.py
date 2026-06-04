@@ -1,8 +1,15 @@
 """Mercurius LLM chat module.
 
-Non-streaming: uses emergentintegrations LlmChat with Claude Sonnet 4.5.
-Streaming: bypasses LlmChat and calls litellm.acompletion(stream=True) directly
-with the same Emergent-proxy parameters that LlmChat would set internally.
+Both streaming and non-streaming go through litellm.acompletion directly.
+The chat is stateless — the caller passes in conversation history (the client
+keeps it in localStorage). No server-side persistence.
+
+Provider selection:
+- If OPENROUTER_API_KEY is set, route through OpenRouter's OpenAI-compatible
+  endpoint. MERCURIUS_MODEL should be an OpenRouter slug like
+  "anthropic/claude-sonnet-4.5" or a ":free" tier model id.
+- Else if EMERGENT_LLM_KEY is set (starts with sk-emergent-), route through
+  the Emergent integration proxy (legacy / dev-only).
 """
 from __future__ import annotations
 
@@ -12,14 +19,11 @@ from pathlib import Path
 from typing import List, Dict, AsyncIterator
 
 import litellm
-from emergentintegrations.llm.chat import LlmChat, UserMessage
-from emergentintegrations.llm.utils import get_integration_proxy_url
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
-MODEL_NAME = "claude-sonnet-4-5-20250929"
-PROVIDER = "anthropic"
+DEFAULT_MODEL = os.environ.get("MERCURIUS_MODEL", "claude-sonnet-4-5-20250929")
 
 
 def _load_system_prompt() -> str:
@@ -40,10 +44,6 @@ def _format_retrieved_passages(passages: List[Dict]) -> str:
 
 
 def format_camera_note(camera: Dict | None) -> str | None:
-    """Render a short italicized note describing the reader's current view.
-
-    Expects {azimuth: float deg, elevation: float deg, region: str | None}.
-    """
     if not camera:
         return None
     try:
@@ -53,7 +53,6 @@ def format_camera_note(camera: Dict | None) -> str | None:
         return None
     region = camera.get("region") or ""
 
-    # Build view phrase from elevation
     if el >= 70:
         view = "looking down the axis toward the Light pole — from here the bicone reads as a circle"
     elif el <= -70:
@@ -110,72 +109,52 @@ def _build_messages(
 
 
 def _litellm_params(messages: List[Dict[str, str]], stream: bool) -> Dict:
-    """Build params identical to what emergentintegrations.LlmChat would use,
-    with our Emergent universal key routed through the integration proxy."""
-    api_key = os.environ["EMERGENT_LLM_KEY"]
     params: Dict = {
-        "model": MODEL_NAME,
+        "model": DEFAULT_MODEL,
         "messages": messages,
-        "api_key": api_key,
         "stream": stream,
     }
-    # Emergent universal keys go through the proxy as OpenAI-compatible.
-    if api_key.startswith("sk-emergent-"):
-        proxy_url = get_integration_proxy_url()
-        params["api_base"] = proxy_url + "/llm"
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    emergent_key = os.environ.get("EMERGENT_LLM_KEY")
+
+    if openrouter_key:
+        params["api_key"] = openrouter_key
+        params["api_base"] = "https://openrouter.ai/api/v1"
         params["custom_llm_provider"] = "openai"
-    return params
+        return params
+
+    if emergent_key and emergent_key.startswith("sk-emergent-"):
+        from emergentintegrations.llm.utils import get_integration_proxy_url
+        params["api_key"] = emergent_key
+        params["api_base"] = get_integration_proxy_url() + "/llm"
+        params["custom_llm_provider"] = "openai"
+        return params
+
+    raise RuntimeError(
+        "No LLM key configured. Set OPENROUTER_API_KEY or EMERGENT_LLM_KEY."
+    )
 
 
 async def generate_response(
     *,
-    conversation_id: str,
     user_text: str,
     retrieved_passages: List[Dict],
     history: List[Dict[str, str]],
     camera_context: Dict | None = None,
 ) -> str:
-    """Non-streaming response (kept for backward-compat with /api/mercurius/chat).
-
-    Uses LlmChat so existing behavior remains identical when no camera context
-    is provided; falls back to direct litellm when camera context is present.
-    """
+    """Non-streaming response."""
     system_prompt = _load_system_prompt()
-
-    # If camera context is present, we need to inject the note. Use direct
-    # litellm path for consistency with the streaming endpoint.
-    if camera_context is not None:
-        messages = _build_messages(
-            system_prompt=system_prompt,
-            history=history,
-            user_text=user_text,
-            retrieved_passages=retrieved_passages,
-            camera_context=camera_context,
-        )
-        params = _litellm_params(messages, stream=False)
-        response = await litellm.acompletion(**params)
-        return response.choices[0].message.content or ""
-
-    # Default LlmChat path (unchanged)
-    api_key = os.environ["EMERGENT_LLM_KEY"]
-    initial_messages: List[Dict[str, str]] = []
-    for m in history:
-        role = m.get("role")
-        content = m.get("content", "")
-        if role in ("user", "assistant") and content:
-            initial_messages.append({"role": role, "content": content})
-
-    chat = LlmChat(
-        api_key=api_key,
-        session_id=conversation_id,
-        system_message=system_prompt,
-        initial_messages=initial_messages if initial_messages else None,
-    ).with_model(PROVIDER, MODEL_NAME)
-
-    grounded_text = (
-        f"{user_text}\n\n---\n\n{_format_retrieved_passages(retrieved_passages)}"
+    messages = _build_messages(
+        system_prompt=system_prompt,
+        history=history,
+        user_text=user_text,
+        retrieved_passages=retrieved_passages,
+        camera_context=camera_context,
     )
-    return await chat.send_message(UserMessage(text=grounded_text))
+    params = _litellm_params(messages, stream=False)
+    response = await litellm.acompletion(**params)
+    return response.choices[0].message.content or ""
 
 
 async def generate_response_stream(
@@ -185,12 +164,7 @@ async def generate_response_stream(
     history: List[Dict[str, str]],
     camera_context: Dict | None = None,
 ) -> AsyncIterator[str]:
-    """Yield assistant tokens as they arrive from Claude.
-
-    Each yielded value is a string token (may be empty). Callers should
-    accumulate to get the full response and persist it once the iterator
-    is exhausted.
-    """
+    """Yield assistant tokens as they arrive."""
     system_prompt = _load_system_prompt()
     messages = _build_messages(
         system_prompt=system_prompt,

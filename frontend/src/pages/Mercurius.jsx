@@ -1,11 +1,20 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Link } from "react-router-dom";
-import axios from "axios";
 import MarkdownLite from "../lib/MarkdownLite";
 import { streamMercuriusChat } from "../lib/mercurius_stream";
+import {
+  listThreads,
+  getCurrentThreadId,
+  setCurrentThreadId,
+  createThread,
+  deleteThread,
+  loadMessages,
+  appendMessage,
+  saveMessages,
+  makeMessageId,
+} from "../lib/mercurius_store";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const LS_KEY = "mercurius_current_conv_id";
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 const STARTERS = [
   "What is this?",
@@ -147,46 +156,32 @@ export default function Mercurius() {
   const [currentId, setCurrentId] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);  // request in flight
-  const [waitingFirstToken, setWaitingFirstToken] = useState(false); // before first token arrives
+  const [sending, setSending] = useState(false);
+  const [waitingFirstToken, setWaitingFirstToken] = useState(false);
   const [error, setError] = useState("");
   const [retryPayload, setRetryPayload] = useState(null);
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
 
-  const loadConversations = useCallback(async () => {
-    try {
-      const r = await axios.get(`${API}/mercurius/conversations`);
-      setConversations(r.data);
-    } catch (e) {
-      console.error("loadConversations", e);
+  // Initial load from localStorage
+  useEffect(() => {
+    setConversations(listThreads());
+    const cur = getCurrentThreadId();
+    if (cur) {
+      setCurrentId(cur);
+      setMessages(loadMessages(cur));
     }
   }, []);
 
-  const loadMessages = useCallback(async (convId) => {
-    if (!convId) {
+  // When user switches threads, load that thread's messages
+  useEffect(() => {
+    if (currentId) {
+      setMessages(loadMessages(currentId));
+      setCurrentThreadId(currentId);
+    } else {
       setMessages([]);
-      return;
+      setCurrentThreadId(null);
     }
-    try {
-      const r = await axios.get(`${API}/mercurius/conversations/${convId}/messages`);
-      setMessages(r.data);
-    } catch (e) {
-      console.error("loadMessages", e);
-    }
-  }, []);
-
-  useEffect(() => {
-    loadConversations();
-  }, [loadConversations]);
-
-  useEffect(() => {
-    if (currentId) loadMessages(currentId);
-  }, [currentId, loadMessages]);
-
-  // Persist active conversation id so the m-shortcut on /geometry can find it.
-  useEffect(() => {
-    if (currentId) localStorage.setItem(LS_KEY, currentId);
   }, [currentId]);
 
   useEffect(() => {
@@ -194,6 +189,10 @@ export default function Mercurius() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages, sending, waitingFirstToken]);
+
+  const refreshThreads = useCallback(() => {
+    setConversations(listThreads());
+  }, []);
 
   const sendMessage = async (text) => {
     const msg = (text ?? input).trim();
@@ -203,76 +202,98 @@ export default function Mercurius() {
     setError("");
     setRetryPayload(null);
 
-    const tmpUserId = `tmp-u-${Date.now()}`;
-    const tmpAsstId = `tmp-a-${Date.now()}`;
-    const optimisticUser = {
-      id: tmpUserId,
+    // Ensure a thread exists; create one if not
+    let threadId = currentId;
+    if (!threadId) {
+      const t = createThread(msg.split("\n")[0]);
+      threadId = t.id;
+      setCurrentId(threadId);
+      refreshThreads();
+    }
+
+    const now = new Date().toISOString();
+    const userMsg = {
+      id: makeMessageId("u"),
       role: "user",
       content: msg,
-      conversation_id: currentId || "tmp",
-      created_at: new Date().toISOString(),
+      created_at: now,
     };
-    setMessages((m) => [...m, optimisticUser]);
+    const asstId = makeMessageId("a");
+    const asstStub = {
+      id: asstId,
+      role: "assistant",
+      content: "",
+      created_at: now,
+      _streaming: true,
+    };
+
+    // Append user message to localStorage immediately; stub assistant in UI only
+    const newMsgs = appendMessage(threadId, userMsg);
+    setMessages([...newMsgs, asstStub]);
     setInput("");
+    refreshThreads();
 
-    let assistantInserted = false;
-    let resolvedConvId = currentId;
+    // Build history sent to backend (everything in thread, including the new user msg)
+    const history = newMsgs.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
 
+    let assistantText = "";
     try {
-      const result = await streamMercuriusChat({
+      await streamMercuriusChat({
         apiBase: API,
-        conversationId: currentId,
         message: msg,
-        onMeta: (meta) => {
-          resolvedConvId = meta.conversation_id;
-          // Insert the empty assistant message slot
-          setMessages((m) => [
-            ...m,
-            {
-              id: meta.assistant_message_id || tmpAsstId,
-              role: "assistant",
-              content: "",
-              conversation_id: meta.conversation_id,
-              created_at: new Date().toISOString(),
-              _streaming: true,
-            },
-          ]);
-          assistantInserted = true;
-        },
-        onToken: (_token, full) => {
+        history,
+        onMeta: () => {},
+        onToken: (_t, full) => {
           if (waitingFirstToken) setWaitingFirstToken(false);
           setWaitingFirstToken(false);
+          assistantText = full;
           setMessages((m) =>
-            m.map((x) => (x._streaming ? { ...x, content: full } : x))
+            m.map((x) => (x.id === asstId ? { ...x, content: full } : x))
           );
         },
         onDone: ({ content }) => {
+          assistantText = content;
           setMessages((m) =>
-            m.map((x) => (x._streaming ? { ...x, content, _streaming: false } : x))
+            m.map((x) =>
+              x.id === asstId ? { ...x, content, _streaming: false } : x
+            )
           );
         },
       });
 
-      if (result.conversationId && result.conversationId !== currentId) {
-        setCurrentId(result.conversationId);
-      }
-      loadConversations();
+      // Persist the completed assistant message
+      const finalMsgs = loadMessages(threadId);
+      finalMsgs.push({
+        id: asstId,
+        role: "assistant",
+        content: assistantText,
+        created_at: new Date().toISOString(),
+      });
+      saveMessages(threadId, finalMsgs);
+      refreshThreads();
     } catch (e) {
       console.error("stream", e);
       const detail = e?.message || "the line went quiet";
       setError(String(detail));
-      // If the connection dropped mid-stream, keep the partial assistant text
-      // but mark _streaming false and surface a retry affordance.
-      if (assistantInserted) {
+
+      if (assistantText) {
+        // We got partial content — keep it, persist what we have
         setMessages((m) =>
-          m.map((x) => (x._streaming ? { ...x, _streaming: false } : x))
+          m.map((x) => (x.id === asstId ? { ...x, _streaming: false } : x))
         );
+        const finalMsgs = loadMessages(threadId);
+        finalMsgs.push({
+          id: asstId,
+          role: "assistant",
+          content: assistantText,
+          created_at: new Date().toISOString(),
+        });
+        saveMessages(threadId, finalMsgs);
       } else {
-        // Nothing arrived — remove the optimistic user, restore input
-        setMessages((m) => m.filter((x) => x.id !== tmpUserId));
-        setInput(msg);
+        // Nothing arrived — remove the stub, restore input
+        setMessages((m) => m.filter((x) => x.id !== asstId));
       }
-      setRetryPayload({ message: msg, conversationId: resolvedConvId || currentId });
+      setRetryPayload({ message: msg });
     } finally {
       setSending(false);
       setWaitingFirstToken(false);
@@ -293,22 +314,16 @@ export default function Mercurius() {
     setMessages([]);
     setError("");
     setRetryPayload(null);
-    localStorage.removeItem(LS_KEY);
     textareaRef.current?.focus();
   };
 
-  const deleteConversation = async (id) => {
-    try {
-      await axios.delete(`${API}/mercurius/conversations/${id}`);
-      if (currentId === id) {
-        setCurrentId(null);
-        setMessages([]);
-        localStorage.removeItem(LS_KEY);
-      }
-      setConversations((cs) => cs.filter((c) => c.id !== id));
-    } catch (e) {
-      console.error("delete", e);
+  const onDeleteThread = (id) => {
+    deleteThread(id);
+    if (currentId === id) {
+      setCurrentId(null);
+      setMessages([]);
     }
+    refreshThreads();
   };
 
   const onKey = (e) => {
@@ -405,7 +420,7 @@ export default function Mercurius() {
               conv={c}
               active={c.id === currentId}
               onClick={() => setCurrentId(c.id)}
-              onDelete={() => deleteConversation(c.id)}
+              onDelete={() => onDeleteThread(c.id)}
             />
           ))}
         </div>
@@ -417,7 +432,7 @@ export default function Mercurius() {
             borderTop: "1px solid var(--ink-rule-soft)",
           }}
         >
-          Phase 0 · POC
+          local · ephemeral
         </div>
       </aside>
 
@@ -583,7 +598,7 @@ export default function Mercurius() {
                 className="font-ui text-[10px] uppercase tracking-[0.18em]"
                 style={{ color: "var(--ink-text-faint)" }}
               >
-                claude sonnet 4.5 · grounded in corpus · streaming
+                grounded in corpus · streaming
               </span>
             </div>
           </div>

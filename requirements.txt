@@ -1,0 +1,8 @@
+fastapi==0.110.1
+pydantic>=2.6.4
+python-dotenv>=1.0.1
+litellm>=1.40.0
+openai>=1.30.0
+rank-bm25==0.2.2
+numpy>=1.26.0
+emergentintegrations==0.1.0

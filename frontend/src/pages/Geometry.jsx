@@ -7,8 +7,7 @@ import { streamMercuriusChat } from "../lib/mercurius_stream";
 import { computeCameraView } from "../lib/camera";
 import MarkdownLite from "../lib/MarkdownLite";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
-const LS_KEY = "mercurius_current_conv_id";
+const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
 // ---------------- Bicone geometry ---------------- //
 
@@ -706,29 +705,31 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
     ]);
     setInput("");
 
-    const convId = localStorage.getItem(LS_KEY) || null;
+    // History: prior completed exchanges in this ephemeral panel session.
+    const history = exchanges
+      .filter((x) => x.user && x.assistant && !x._streaming)
+      .flatMap((x) => [
+        { role: "user", content: x.user },
+        { role: "assistant", content: x.assistant },
+      ]);
 
-    let convIdResolved = convId;
-    let assistantInserted = false;
+    let gotText = "";
     try {
       await streamMercuriusChat({
         apiBase: API,
-        conversationId: convId,
         message: msg,
+        history,
         cameraContext: cam,
-        useLatestConversation: !convId,
-        onMeta: (meta) => {
-          convIdResolved = meta.conversation_id;
-          assistantInserted = true;
-        },
         onToken: (_t, full) => {
           if (waitingFirstToken) setWaitingFirstToken(false);
           setWaitingFirstToken(false);
+          gotText = full;
           setExchanges((xs) =>
             xs.map((x) => (x.id === exId ? { ...x, assistant: full } : x))
           );
         },
         onDone: ({ content }) => {
+          gotText = content;
           setExchanges((xs) =>
             xs.map((x) =>
               x.id === exId ? { ...x, assistant: content, _streaming: false } : x
@@ -736,14 +737,10 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
           );
         },
       });
-
-      if (convIdResolved) {
-        localStorage.setItem(LS_KEY, convIdResolved);
-      }
     } catch (e) {
       console.error("panel stream", e);
       setError(String(e.message || e));
-      if (assistantInserted) {
+      if (gotText) {
         setExchanges((xs) =>
           xs.map((x) => (x.id === exId ? { ...x, _streaming: false } : x))
         );
