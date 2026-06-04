@@ -61,6 +61,8 @@ class ChatRequest(BaseModel):
     message: str
     history: List[HistoryMessage] = []
     camera_context: Optional[CameraContext] = None
+    openrouter_key: Optional[str] = None
+    model: Optional[str] = None
 
 
 class RetrievedPassage(BaseModel):
@@ -125,6 +127,8 @@ async def chat_endpoint(req: ChatRequest):
             retrieved_passages=passages,
             history=history,
             camera_context=req.camera_context.model_dump() if req.camera_context else None,
+            api_key_override=req.openrouter_key,
+            model_override=req.model,
         )
     except Exception as e:
         logger.exception("Mercurius generation failed")
@@ -183,6 +187,8 @@ async def chat_stream_endpoint(req: ChatRequest):
                 retrieved_passages=passages,
                 history=history,
                 camera_context=camera_dict,
+                api_key_override=req.openrouter_key,
+                model_override=req.model,
             ):
                 accumulated.append(token)
                 yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"

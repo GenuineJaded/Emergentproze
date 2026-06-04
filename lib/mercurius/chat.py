@@ -4,23 +4,26 @@ Both streaming and non-streaming go through litellm.acompletion directly.
 The chat is stateless — the caller passes in conversation history (the client
 keeps it in localStorage). No server-side persistence.
 
-Routes through OpenRouter's OpenAI-compatible endpoint. `OPENROUTER_API_KEY`
-is required. `MERCURIUS_MODEL` (optional) is an OpenRouter model slug like
-`anthropic/claude-sonnet-4.5` or a `:free` tier id.
+Routes through OpenRouter's OpenAI-compatible endpoint.
+
+Key precedence per call: explicit `api_key_override` (BYOK from the visitor)
+beats the `OPENROUTER_API_KEY` env var (admin's key, used as free-tier
+default). Model precedence is the same: explicit `model_override` beats
+`MERCURIUS_MODEL` env var beats the hard default.
 """
 from __future__ import annotations
 
 import os
 import logging
 from pathlib import Path
-from typing import List, Dict, AsyncIterator
+from typing import List, Dict, AsyncIterator, Optional
 
 import litellm
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
-DEFAULT_MODEL = os.environ.get("MERCURIUS_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+HARD_DEFAULT_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 
 
 def _load_system_prompt() -> str:
@@ -105,12 +108,28 @@ def _build_messages(
     return messages
 
 
-def _litellm_params(messages: List[Dict[str, str]], stream: bool) -> Dict:
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+def _resolve_key_and_model(
+    api_key_override: Optional[str],
+    model_override: Optional[str],
+) -> tuple[str, str]:
+    api_key = (api_key_override or os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+        raise RuntimeError(
+            "No OpenRouter key available. Either set OPENROUTER_API_KEY on the "
+            "deploy, or paste your own key in settings."
+        )
+    model = (model_override or os.environ.get("MERCURIUS_MODEL") or HARD_DEFAULT_MODEL).strip()
+    return api_key, model
+
+
+def _litellm_params(
+    messages: List[Dict[str, str]],
+    stream: bool,
+    api_key: str,
+    model: str,
+) -> Dict:
     return {
-        "model": DEFAULT_MODEL,
+        "model": model,
         "messages": messages,
         "stream": stream,
         "api_key": api_key,
@@ -125,8 +144,11 @@ async def generate_response(
     retrieved_passages: List[Dict],
     history: List[Dict[str, str]],
     camera_context: Dict | None = None,
+    api_key_override: Optional[str] = None,
+    model_override: Optional[str] = None,
 ) -> str:
     """Non-streaming response."""
+    api_key, model = _resolve_key_and_model(api_key_override, model_override)
     system_prompt = _load_system_prompt()
     messages = _build_messages(
         system_prompt=system_prompt,
@@ -135,7 +157,7 @@ async def generate_response(
         retrieved_passages=retrieved_passages,
         camera_context=camera_context,
     )
-    params = _litellm_params(messages, stream=False)
+    params = _litellm_params(messages, stream=False, api_key=api_key, model=model)
     response = await litellm.acompletion(**params)
     return response.choices[0].message.content or ""
 
@@ -146,8 +168,11 @@ async def generate_response_stream(
     retrieved_passages: List[Dict],
     history: List[Dict[str, str]],
     camera_context: Dict | None = None,
+    api_key_override: Optional[str] = None,
+    model_override: Optional[str] = None,
 ) -> AsyncIterator[str]:
     """Yield assistant tokens as they arrive."""
+    api_key, model = _resolve_key_and_model(api_key_override, model_override)
     system_prompt = _load_system_prompt()
     messages = _build_messages(
         system_prompt=system_prompt,
@@ -156,7 +181,7 @@ async def generate_response_stream(
         retrieved_passages=retrieved_passages,
         camera_context=camera_context,
     )
-    params = _litellm_params(messages, stream=True)
+    params = _litellm_params(messages, stream=True, api_key=api_key, model=model)
     response = await litellm.acompletion(**params)
     async for chunk in response:
         try:

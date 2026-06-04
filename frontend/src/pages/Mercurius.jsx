@@ -13,6 +13,8 @@ import {
   saveMessages,
   makeMessageId,
 } from "../lib/mercurius_store";
+import { loadSettings } from "../lib/mercurius_settings";
+import KeyPanel from "../lib/KeyPanel";
 
 const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
@@ -160,6 +162,7 @@ export default function Mercurius() {
   const [waitingFirstToken, setWaitingFirstToken] = useState(false);
   const [error, setError] = useState("");
   const [retryPayload, setRetryPayload] = useState(null);
+  const [keyPanelOpen, setKeyPanelOpen] = useState(false);
   const scrollRef = useRef(null);
   const textareaRef = useRef(null);
 
@@ -236,12 +239,16 @@ export default function Mercurius() {
     // Build history sent to backend (everything in thread, including the new user msg)
     const history = newMsgs.slice(0, -1).map((m) => ({ role: m.role, content: m.content }));
 
+    const { openrouter_key: byokKey, model: byokModel } = loadSettings();
+
     let assistantText = "";
     try {
       await streamMercuriusChat({
         apiBase: API,
         message: msg,
         history,
+        openrouterKey: byokKey,
+        model: byokModel,
         onMeta: () => {},
         onToken: (_t, full) => {
           if (waitingFirstToken) setWaitingFirstToken(false);
@@ -594,16 +601,30 @@ export default function Mercurius() {
                 }}
                 disabled={sending}
               />
-              <span
-                className="font-ui text-[10px] uppercase tracking-[0.18em]"
-                style={{ color: "var(--ink-text-faint)" }}
+              <button
+                type="button"
+                data-testid="open-key-panel"
+                onClick={() => setKeyPanelOpen(true)}
+                className="font-ui text-[10px] uppercase tracking-[0.18em] transition-colors duration-200"
+                style={{
+                  color: "var(--ink-text-faint)",
+                  background: "transparent",
+                  border: "none",
+                  cursor: "pointer",
+                  padding: "4px 6px",
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = "var(--ink-text)")}
+                onMouseLeave={(e) => (e.currentTarget.style.color = "var(--ink-text-faint)")}
+                title="bring your own key"
               >
-                grounded in corpus · streaming
-              </span>
+                key · model
+              </button>
             </div>
           </div>
         </div>
       </main>
+
+      <KeyPanel open={keyPanelOpen} onClose={() => setKeyPanelOpen(false)} />
     </div>
   );
 }

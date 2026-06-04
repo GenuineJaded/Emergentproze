@@ -6,6 +6,8 @@ import * as THREE from "three";
 import { streamMercuriusChat } from "../lib/mercurius_stream";
 import { computeCameraView } from "../lib/camera";
 import MarkdownLite from "../lib/MarkdownLite";
+import { loadSettings } from "../lib/mercurius_settings";
+import KeyPanel from "../lib/KeyPanel";
 
 const API = `${process.env.REACT_APP_BACKEND_URL || ""}/api`;
 
@@ -713,6 +715,8 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
         { role: "assistant", content: x.assistant },
       ]);
 
+    const { openrouter_key: byokKey, model: byokModel } = loadSettings();
+
     let gotText = "";
     try {
       await streamMercuriusChat({
@@ -720,6 +724,8 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
         message: msg,
         history,
         cameraContext: cam,
+        openrouterKey: byokKey,
+        model: byokModel,
         onToken: (_t, full) => {
           if (waitingFirstToken) setWaitingFirstToken(false);
           setWaitingFirstToken(false);
@@ -974,6 +980,7 @@ export default function Geometry() {
 
   const [hasInteracted, setHasInteracted] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [keyPanelOpen, setKeyPanelOpen] = useState(false);
 
   // Concept tree (macros + children, no passages)
   const [macros, setMacros] = useState([]);
@@ -1178,6 +1185,29 @@ export default function Geometry() {
         </div>
       )}
 
+      {/* Top-right: key panel trigger */}
+      <button
+        type="button"
+        data-testid="open-key-panel-geometry"
+        onClick={() => setKeyPanelOpen(true)}
+        className="absolute font-ui text-[10px] uppercase tracking-[0.18em] transition-colors duration-200"
+        style={{
+          top: 28,
+          right: 32,
+          color: "var(--ink-text-faint)",
+          background: "transparent",
+          border: "none",
+          cursor: "pointer",
+          padding: "4px 6px",
+          zIndex: 30,
+        }}
+        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--ink-text)")}
+        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--ink-text-faint)")}
+        title="bring your own key"
+      >
+        key · model
+      </button>
+
       {/* Bottom-right legend */}
       <div
         className="absolute bottom-10 right-8 font-ui text-[10px] uppercase tracking-[0.2em] text-right pointer-events-none"
@@ -1189,6 +1219,9 @@ export default function Geometry() {
           press <span style={{ fontFamily: "Inter Tight, monospace" }}>m</span> · ask from here
         </div>
       </div>
+
+      <KeyPanel open={keyPanelOpen} onClose={() => setKeyPanelOpen(false)} />
+
 
       {/* Reading card */}
       <ReadingCard

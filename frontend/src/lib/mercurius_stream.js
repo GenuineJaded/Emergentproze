@@ -17,6 +17,8 @@ export async function streamMercuriusChat({
   message,
   history = [],
   cameraContext = null,
+  openrouterKey = "",
+  model = "",
   onMeta = () => {},
   onToken = () => {},
   onDone = () => {},
@@ -29,6 +31,8 @@ export async function streamMercuriusChat({
       message,
       history,
       camera_context: cameraContext,
+      openrouter_key: openrouterKey || null,
+      model: model || null,
     }),
     signal,
   });
