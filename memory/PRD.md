@@ -13,11 +13,10 @@ Full brief preserved verbatim in the conversation history; corpus saved to `/app
 
 ## Architecture (Phase 0)
 - **Frontend**: React 19 (CRA + craco), `@react-three/fiber`, `@react-three/drei`, `three`. Routes: `/`, `/geometry`, `/mercurius` (also `/companion`).
-- **Backend**: FastAPI + Motor (async MongoDB) + `emergentintegrations` (Claude Sonnet 4.5 via the Emergent universal key). Module layout: `backend/server.py`, `backend/mercurius/{system_prompt.md, corpus.py, chat.py, voice_test_outputs.md, run_voice_tests.py}`.
-- **Retrieval**: BM25 over 45 chunks across the 6 corpus documents (`rank-bm25`), section-heading-aware paragraph chunking, light suffix-stemming + lowercase tokenization. Chunks persisted in `mercurius_chunks` Mongo collection; BM25 index lives in-process and is rebuilt at startup.
-  - **Why BM25 not embeddings**: the Emergent universal key proxy does not expose `text-embedding-3-small` (verified via `/v1/models`). The corpus vocabulary is unusually distinctive (bicone, equator, π, persistence, metabolization, inversion), so BM25 retrieves with sharp precision at this scale. Decision logged with the user.
-- **Conversation persistence**: `mercurius_conversations` + `mercurius_messages` Mongo collections, keyed by UUID. Multi-thread sidebar.
-- **No auth, no analytics, no third-party trackers** (PostHog removed from `index.html`; `@emergentbase/visual-edits` babel plugin disabled in `craco.config.js` because it injects `x-line-number` JSX attributes that break react-three-fiber and conflicts with the "no trackers" clause in the brief).
+- **Backend**: FastAPI as a single Vercel Python serverless function (`api/index.py`). Stateless — no database. Conversation history flows up from the client per request. LLM calls via `litellm` against OpenRouter's OpenAI-compatible endpoint. Module layout: `lib/mercurius/{system_prompt.md, corpus.py, chat.py, concepts.py, voice_test_outputs.md}`.
+- **Retrieval**: BM25 over 45 chunks across the 6 corpus documents (`rank-bm25`), section-heading-aware paragraph chunking, light suffix-stemming + lowercase tokenization. Index is built in-process at module import time from disk (no DB).
+- **Conversation persistence**: client-side localStorage. Each visitor's threads live in their browser; no accounts, no profiles, no server-side persistence.
+- **No auth, no analytics, no third-party trackers.**
 
 ## Implemented (2026-05-23)
 - Home page (`/`) — quiet typography, EB Garamond serif body, Inter Tight UI chrome, Fraunces italic wordmark.
@@ -33,7 +32,7 @@ Full brief preserved verbatim in the conversation history; corpus saved to `/app
   - `POST /api/mercurius/chat` → retrieves top-5 passages, sends to Claude with system prompt + history, persists user/assistant messages, returns assistant + passages
 - System prompt (`/app/backend/mercurius/system_prompt.md`) — Hermes 60% / Trickster 25% / Nietzsche 15% blend, explicit do/don't list, 3 few-shot exemplars.
 - Voice calibration outputs (`/app/backend/mercurius/voice_test_outputs.md`) — all 6 brief-specified prompts with full responses + retrieved-passage scoring.
-- Corpus: 6 docs (1 verbatim from brief, 5 downloaded from `customer-assets.emergentagent.com` and converted via `python-docx`).
+- Corpus: 6 markdown documents in `corpus/`.
 
 ## Acceptance criteria (Phase 0) — status
 - [x] Home page with two clear links
@@ -75,5 +74,5 @@ Full brief preserved verbatim in the conversation history; corpus saved to `/app
 
 ## Things to surface to the user in the finish summary
 - Voice samples from the 6 prompts (in voice_test_outputs.md)
-- Decision log: BM25 instead of embeddings (Emergent proxy has no embedding endpoint)
+- Decision log: BM25 instead of embeddings — corpus vocabulary is sharp enough at this scale; no embedding model needed
 - Decision log: visual-edits babel plugin disabled (it injects `x-*` props that break r3f and contradicts the no-trackers clause)

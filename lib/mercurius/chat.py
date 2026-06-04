@@ -4,12 +4,9 @@ Both streaming and non-streaming go through litellm.acompletion directly.
 The chat is stateless — the caller passes in conversation history (the client
 keeps it in localStorage). No server-side persistence.
 
-Provider selection:
-- If OPENROUTER_API_KEY is set, route through OpenRouter's OpenAI-compatible
-  endpoint. MERCURIUS_MODEL should be an OpenRouter slug like
-  "anthropic/claude-sonnet-4.5" or a ":free" tier model id.
-- Else if EMERGENT_LLM_KEY is set (starts with sk-emergent-), route through
-  the Emergent integration proxy (legacy / dev-only).
+Routes through OpenRouter's OpenAI-compatible endpoint. `OPENROUTER_API_KEY`
+is required. `MERCURIUS_MODEL` (optional) is an OpenRouter model slug like
+`anthropic/claude-sonnet-4.5` or a `:free` tier id.
 """
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ import litellm
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
-DEFAULT_MODEL = os.environ.get("MERCURIUS_MODEL", "claude-sonnet-4-5-20250929")
+DEFAULT_MODEL = os.environ.get("MERCURIUS_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
 
 def _load_system_prompt() -> str:
@@ -109,31 +106,17 @@ def _build_messages(
 
 
 def _litellm_params(messages: List[Dict[str, str]], stream: bool) -> Dict:
-    params: Dict = {
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set.")
+    return {
         "model": DEFAULT_MODEL,
         "messages": messages,
         "stream": stream,
+        "api_key": api_key,
+        "api_base": "https://openrouter.ai/api/v1",
+        "custom_llm_provider": "openai",
     }
-
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    emergent_key = os.environ.get("EMERGENT_LLM_KEY")
-
-    if openrouter_key:
-        params["api_key"] = openrouter_key
-        params["api_base"] = "https://openrouter.ai/api/v1"
-        params["custom_llm_provider"] = "openai"
-        return params
-
-    if emergent_key and emergent_key.startswith("sk-emergent-"):
-        from emergentintegrations.llm.utils import get_integration_proxy_url
-        params["api_key"] = emergent_key
-        params["api_base"] = get_integration_proxy_url() + "/llm"
-        params["custom_llm_provider"] = "openai"
-        return params
-
-    raise RuntimeError(
-        "No LLM key configured. Set OPENROUTER_API_KEY or EMERGENT_LLM_KEY."
-    )
 
 
 async def generate_response(
