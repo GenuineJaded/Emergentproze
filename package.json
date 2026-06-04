@@ -1,0 +1,10 @@
+{
+  "name": "mercurius-living-sketch",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The Living Sketch — Geometry + Mercurius. Frontend lives in ./frontend, backend in ./api.",
+  "scripts": {
+    "build": "yarn --cwd frontend install --frozen-lockfile=false && yarn --cwd frontend build",
+    "start": "yarn --cwd frontend start"
+  }
+}
