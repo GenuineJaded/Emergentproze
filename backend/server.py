@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from mercurius import corpus as mercurius_corpus
 from mercurius import chat as mercurius_chat
+from mercurius import concepts as mercurius_concepts
 
 # Configure logging
 logging.basicConfig(
@@ -125,6 +126,24 @@ async def ingest():
     """Ingest the corpus (idempotent). Safe to call multiple times."""
     result = await mercurius_corpus.ingest_corpus(db)
     await mercurius_corpus.reload_cache(db)
+    return result
+
+
+# --- Geometry: concept tree + passages --- #
+
+@api_router.get("/geometry/concepts")
+async def list_concepts():
+    """Return the macro concept tree with positions (no passages)."""
+    return {"concepts": mercurius_concepts.list_macros()}
+
+
+@api_router.get("/geometry/concepts/{concept_id}")
+async def get_concept(concept_id: str):
+    """Return a single concept's metadata + top corpus passages."""
+    await _ensure_corpus()
+    result = await mercurius_concepts.get_concept_passages(db, concept_id, k=3)
+    if result is None:
+        raise HTTPException(status_code=404, detail="concept not found")
     return result
 
 

@@ -128,15 +128,41 @@ function BiconeSurface({ radius = 1.4, height = 1.6 }) {
   );
 }
 
-function Node({ position, color, label, sub, testId, accent = false }) {
+// ---------------- Nodes ---------------- //
+
+function MacroNode({ position, color, label, sub, testId, accent = false, focused, dimmed, onClick }) {
+  const meshRef = useRef();
+  const [hover, setHover] = useState(false);
+  const radius = focused || hover ? 0.058 : 0.045;
+  const labelOpacity = dimmed ? 0.35 : 1;
+
   return (
     <group position={position}>
-      <mesh>
-        <sphereGeometry args={[0.045, 24, 24]} />
+      <mesh
+        ref={meshRef}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (meshRef.current) {
+            const wp = new THREE.Vector3();
+            meshRef.current.getWorldPosition(wp);
+            onClick({ worldPos: wp });
+          }
+        }}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+          document.body.style.cursor = "pointer";
+        }}
+        onPointerOut={() => {
+          setHover(false);
+          document.body.style.cursor = "";
+        }}
+      >
+        <sphereGeometry args={[radius, 24, 24]} />
         <meshStandardMaterial
           color={color}
           emissive={color}
-          emissiveIntensity={accent ? 1.0 : 0.7}
+          emissiveIntensity={accent || focused || hover ? 1.0 : 0.7}
           metalness={0.2}
           roughness={0.4}
         />
@@ -153,7 +179,7 @@ function Node({ position, color, label, sub, testId, accent = false }) {
           style={{
             background: "rgba(13,17,23,0.78)",
             backdropFilter: "blur(6px)",
-            border: "1px solid rgba(200,162,107,0.22)",
+            border: `1px solid ${focused ? "rgba(200,162,107,0.55)" : "rgba(200,162,107,0.22)"}`,
             borderRadius: 4,
             padding: "5px 9px",
             whiteSpace: "nowrap",
@@ -163,6 +189,8 @@ function Node({ position, color, label, sub, testId, accent = false }) {
             textTransform: "uppercase",
             transform: "translate(14px, -50%)",
             userSelect: "none",
+            opacity: labelOpacity,
+            transition: "opacity 600ms ease, border-color 400ms ease",
           }}
         >
           <div style={{ color: "var(--ink-text)" }}>{label}</div>
@@ -187,9 +215,142 @@ function Node({ position, color, label, sub, testId, accent = false }) {
   );
 }
 
-function BreathingRotation({ groupRef, idleRef }) {
+function ChildNode({ position, label, focused, fade, onClick }) {
+  const meshRef = useRef();
+  const [hover, setHover] = useState(false);
+  const radius = focused || hover ? 0.038 : 0.028;
+
+  return (
+    <group position={position}>
+      <mesh
+        ref={meshRef}
+        onClick={(e) => {
+          e.stopPropagation();
+          if (meshRef.current) {
+            const wp = new THREE.Vector3();
+            meshRef.current.getWorldPosition(wp);
+            onClick({ worldPos: wp });
+          }
+        }}
+        onPointerOver={(e) => {
+          e.stopPropagation();
+          setHover(true);
+          document.body.style.cursor = "pointer";
+        }}
+        onPointerOut={() => {
+          setHover(false);
+          document.body.style.cursor = "";
+        }}
+      >
+        <sphereGeometry args={[radius, 18, 18]} />
+        <meshStandardMaterial
+          color="#a08862"
+          emissive="#a08862"
+          emissiveIntensity={focused || hover ? 0.95 : 0.55}
+          metalness={0.15}
+          roughness={0.55}
+        />
+      </mesh>
+      <Html
+        center
+        distanceFactor={6}
+        zIndexRange={[0, 0]}
+        style={{ pointerEvents: "none" }}
+      >
+        <div
+          className="font-ui"
+          style={{
+            background: "rgba(13,17,23,0.72)",
+            backdropFilter: "blur(4px)",
+            border: `1px solid ${focused ? "rgba(200,162,107,0.55)" : "rgba(200,162,107,0.16)"}`,
+            borderRadius: 3,
+            padding: "3px 7px",
+            whiteSpace: "nowrap",
+            color: "var(--ink-text-dim)",
+            fontSize: 9,
+            letterSpacing: "0.08em",
+            textTransform: "uppercase",
+            transform: "translate(12px, -50%)",
+            userSelect: "none",
+            opacity: fade,
+            transition: "opacity 600ms ease, border-color 400ms ease, color 400ms ease",
+            ...(focused ? { color: "var(--ink-text)" } : {}),
+          }}
+        >
+          {label}
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+// ---------------- Camera control ---------------- //
+
+function CameraController({ targetWorldPos, controlsRef, controlsReady }) {
+  const { camera } = useThree();
+  const animRef = useRef(null);
+  const lastTargetRef = useRef(null);
+
+  useEffect(() => {
+    // Only kick off a new animation when the target identity actually changes
+    if (lastTargetRef.current === targetWorldPos) return;
+    lastTargetRef.current = targetWorldPos;
+    if (!controlsReady) return;
+
+    const startPos = camera.position.clone();
+    const startTarget = controlsRef.current
+      ? controlsRef.current.target.clone()
+      : new THREE.Vector3();
+
+    let endPos;
+    let endTarget;
+    if (targetWorldPos) {
+      // Stay along the same line of sight from current camera to the target,
+      // but move in to a fixed standoff distance.
+      const dir = startPos.clone().sub(targetWorldPos).normalize();
+      endPos = targetWorldPos.clone().add(dir.multiplyScalar(2.6));
+      endTarget = targetWorldPos.clone();
+    } else {
+      endPos = new THREE.Vector3(3.8, 2.6, 3.8);
+      endTarget = new THREE.Vector3(0, 0.1, 0);
+    }
+
+    animRef.current = {
+      startPos,
+      startTarget,
+      endPos,
+      endTarget,
+      startTime: performance.now(),
+      duration: 1300,
+    };
+  }, [targetWorldPos, camera, controlsRef, controlsReady]);
+
+  useFrame(() => {
+    if (!animRef.current) return;
+    const now = performance.now();
+    const t = Math.min(1, (now - animRef.current.startTime) / animRef.current.duration);
+    // ease-in-out cubic
+    const ease = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    camera.position.lerpVectors(animRef.current.startPos, animRef.current.endPos, ease);
+    if (controlsRef.current) {
+      const newTarget = animRef.current.startTarget
+        .clone()
+        .lerp(animRef.current.endTarget, ease);
+      controlsRef.current.target.copy(newTarget);
+      controlsRef.current.update();
+    }
+    if (t >= 1) animRef.current = null;
+  });
+
+  return null;
+}
+
+// ---------------- Rotation + camera tracking ---------------- //
+
+function BreathingRotation({ groupRef, idleRef, paused }) {
   useFrame((_, dt) => {
     if (!groupRef.current) return;
+    if (paused) return;
     const now = performance.now();
     const sinceInteract = now - idleRef.current.lastInteract;
     if (sinceInteract > 2500) {
@@ -219,7 +380,6 @@ function InteractionWatcher({ idleRef, onFirstInteract }) {
   return null;
 }
 
-// Updates a ref with the current camera azimuth/elevation/region every frame.
 function CameraTracker({ cameraStateRef }) {
   const { camera } = useThree();
   useFrame(() => {
@@ -228,10 +388,37 @@ function CameraTracker({ cameraStateRef }) {
   return null;
 }
 
-function Scene({ idleRef, onFirstInteract, cameraStateRef }) {
+// ---------------- Scene ---------------- //
+
+const MACRO_COLORS = {
+  light: "#e8c585",
+  dark: "#5a7aa0",
+  "pi-paradox": "#c8a26b",
+  "inversion-access": "#b89870",
+  "lived-actuality": "#a8a194",
+};
+
+function Scene({
+  idleRef,
+  onFirstInteract,
+  cameraStateRef,
+  macros,
+  focusedConcept,
+  focusedMacroId,
+  childFade,
+  onMacroClick,
+  onChildClick,
+  onBackgroundClick,
+  targetWorldPos,
+  controlsRef,
+  controlsReady,
+  setControlsReady,
+}) {
   const groupRef = useRef();
   const radius = 1.4;
   const height = 1.6;
+  const rotationPaused = !!focusedConcept;
+
   return (
     <>
       <ambientLight intensity={0.45} />
@@ -240,25 +427,71 @@ function Scene({ idleRef, onFirstInteract, cameraStateRef }) {
 
       <InteractionWatcher idleRef={idleRef} onFirstInteract={onFirstInteract} />
       <CameraTracker cameraStateRef={cameraStateRef} />
+      <CameraController
+        targetWorldPos={targetWorldPos}
+        controlsRef={controlsRef}
+        controlsReady={controlsReady}
+      />
+
+      {/* background-click catcher behind everything; transparent giant sphere */}
+      <mesh
+        onClick={(e) => {
+          e.stopPropagation();
+          onBackgroundClick();
+        }}
+        scale={[60, 60, 60]}
+      >
+        <sphereGeometry args={[1, 8, 8]} />
+        <meshBasicMaterial transparent opacity={0} side={THREE.BackSide} depthWrite={false} />
+      </mesh>
 
       <group ref={groupRef}>
         <BiconeSurface radius={radius} height={height} />
         <EquatorRing radius={radius} />
         <PolarAxis height={height} />
 
-        <Node position={[0, height, 0]} color="#e8c585" label="Light" sub="visible · articulated · conscious" testId="node-light" />
-        <Node position={[0, -height, 0]} color="#5a7aa0" label="Dark" sub="hidden · latent · subconscious" testId="node-dark" />
-        <Node position={[radius, 0, 0]} color="#c8a26b" label="π · Paradox" sub="where linear meets circular" accent testId="node-pi" />
-        <Node position={[0.15, height * 0.82, 0.15]} color="#b89870" label="Inversion access" sub="hidden presses into surface" testId="node-inversion" />
-        <Node position={[0.0, 0.0, -0.35]} color="#a8a194" label="Lived Actuality" sub="where Ground · Love · Change tension" testId="node-lived-actuality" />
+        {macros.map((macro) => {
+          const isFocusedMacro = focusedConcept && focusedConcept.id === macro.id;
+          const dimmed = focusedConcept && focusedMacroId !== null && focusedMacroId !== macro.id;
+          return (
+            <group key={macro.id}>
+              <MacroNode
+                position={macro.position}
+                color={MACRO_COLORS[macro.id] || "#c8a26b"}
+                label={macro.label}
+                sub={macro.sub}
+                testId={`node-${macro.id}`}
+                accent={macro.accent}
+                focused={isFocusedMacro}
+                dimmed={dimmed}
+                onClick={({ worldPos }) => onMacroClick(macro.id, worldPos)}
+              />
+              {focusedMacroId === macro.id &&
+                macro.children.map((child) => (
+                  <ChildNode
+                    key={child.id}
+                    position={child.position}
+                    label={child.label}
+                    focused={focusedConcept && focusedConcept.id === child.id}
+                    fade={childFade}
+                    onClick={({ worldPos }) => onChildClick(child.id, worldPos)}
+                  />
+                ))}
+            </group>
+          );
+        })}
       </group>
 
-      <BreathingRotation groupRef={groupRef} idleRef={idleRef} />
+      <BreathingRotation groupRef={groupRef} idleRef={idleRef} paused={rotationPaused} />
 
       <OrbitControls
+        ref={(c) => {
+          controlsRef.current = c;
+          if (c && !controlsReady) setControlsReady(true);
+        }}
         enableDamping
         dampingFactor={0.08}
-        minDistance={2}
+        minDistance={1.6}
         maxDistance={9}
         rotateSpeed={0.65}
         zoomSpeed={0.6}
@@ -268,10 +501,145 @@ function Scene({ idleRef, onFirstInteract, cameraStateRef }) {
   );
 }
 
-// ---------------- Floating Mercurius panel ---------------- //
+// ---------------- Reading card ---------------- //
+
+function ReadingCard({ concept, loading, onClose }) {
+  if (!concept && !loading) return null;
+  return (
+    <div
+      data-testid="reading-card"
+      className="absolute"
+      style={{
+        bottom: 36,
+        left: 32,
+        width: 420,
+        maxHeight: "72vh",
+        display: "flex",
+        flexDirection: "column",
+        background: "rgba(13,17,23,0.94)",
+        backdropFilter: "blur(14px)",
+        border: "1px solid rgba(200,162,107,0.30)",
+        borderRadius: 6,
+        boxShadow: "0 20px 60px rgba(0,0,0,0.55)",
+        color: "var(--ink-text)",
+        zIndex: 40,
+      }}
+    >
+      {/* Header */}
+      <div
+        className="flex items-start justify-between px-5 py-4"
+        style={{ borderBottom: "1px solid var(--ink-rule-soft)" }}
+      >
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {concept?.parent_label && (
+            <div
+              className="font-ui"
+              style={{
+                color: "var(--ink-text-faint)",
+                fontSize: 9,
+                letterSpacing: "0.18em",
+                textTransform: "uppercase",
+                marginBottom: 4,
+              }}
+            >
+              {concept.parent_label} ·
+            </div>
+          )}
+          <div
+            className="font-serif"
+            style={{
+              fontSize: 22,
+              lineHeight: 1.15,
+              color: "var(--ink-text)",
+              fontStyle: concept?.parent_label ? "normal" : "italic",
+            }}
+          >
+            {concept?.label || "…"}
+          </div>
+          {concept?.sub && (
+            <div
+              className="font-serif italic"
+              style={{ color: "var(--ink-text-dim)", fontSize: 13, marginTop: 4 }}
+            >
+              {concept.sub}
+            </div>
+          )}
+        </div>
+        <button
+          type="button"
+          data-testid="reading-card-close"
+          onClick={onClose}
+          className="font-ui transition-colors duration-200"
+          style={{
+            background: "transparent",
+            border: "none",
+            color: "var(--ink-text-faint)",
+            cursor: "pointer",
+            fontSize: 10,
+            letterSpacing: "0.18em",
+            textTransform: "uppercase",
+            marginLeft: 12,
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--ink-text)")}
+          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--ink-text-faint)")}
+          title="Esc"
+        >
+          esc
+        </button>
+      </div>
+
+      {/* Body */}
+      <div
+        className="overflow-y-auto px-5 py-4"
+        style={{ flex: 1, minHeight: 60 }}
+      >
+        {loading && (
+          <div
+            className="font-serif italic"
+            style={{ color: "var(--ink-text-faint)", fontSize: 14 }}
+          >
+            drawing from the corpus…
+          </div>
+        )}
+        {!loading && concept && concept.passages.length === 0 && (
+          <div
+            className="font-serif italic"
+            style={{ color: "var(--ink-text-faint)", fontSize: 14 }}
+          >
+            the map runs out here.
+          </div>
+        )}
+        {!loading &&
+          concept &&
+          concept.passages.map((p, i) => (
+            <div key={i} style={{ marginBottom: i < concept.passages.length - 1 ? 22 : 0 }}>
+              <div
+                className="font-ui"
+                style={{
+                  color: "var(--ink-text-faint)",
+                  fontSize: 9,
+                  letterSpacing: "0.18em",
+                  textTransform: "uppercase",
+                  marginBottom: 8,
+                }}
+              >
+                {p.doc_title}
+                {p.section ? ` · ${p.section}` : ""}
+              </div>
+              <div className="mercurius-prose" style={{ fontSize: 14 }}>
+                <MarkdownLite text={p.text} />
+              </div>
+            </div>
+          ))}
+      </div>
+    </div>
+  );
+}
+
+// ---------------- Floating Mercurius panel (unchanged) ---------------- //
 
 function MercuriusPanel({ open, onClose, cameraStateRef }) {
-  const [exchanges, setExchanges] = useState([]); // [{user, assistant, _streaming, _camera}]
+  const [exchanges, setExchanges] = useState([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [waitingFirstToken, setWaitingFirstToken] = useState(false);
@@ -281,16 +649,13 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
   const inputRef = useRef(null);
   const scrollRef = useRef(null);
 
-  // Focus input on open
   useEffect(() => {
     if (open) {
-      // tiny delay so transition lands
       const t = setTimeout(() => inputRef.current?.focus(), 60);
       return () => clearTimeout(t);
     }
   }, [open]);
 
-  // Esc + click-outside
   useEffect(() => {
     if (!open) return;
     const onKey = (e) => {
@@ -305,7 +670,6 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
       }
     };
     window.addEventListener("keydown", onKey);
-    // mousedown so we don't close on the same click that triggered something inside
     document.addEventListener("mousedown", onDoc);
     return () => {
       window.removeEventListener("keydown", onKey);
@@ -342,8 +706,6 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
     ]);
     setInput("");
 
-    // Use the conversation thread the user has currently open in /mercurius
-    // (persisted in localStorage). If none, use the latest one server-side.
     const convId = localStorage.getItem(LS_KEY) || null;
 
     let convIdResolved = convId;
@@ -427,7 +789,6 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
         zIndex: 50,
       }}
     >
-      {/* Header */}
       <div
         className="flex items-center justify-between px-4 py-3"
         style={{ borderBottom: "1px solid var(--ink-rule-soft)" }}
@@ -465,7 +826,6 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
         </button>
       </div>
 
-      {/* Scrollable chat history (this session only) */}
       <div
         ref={scrollRef}
         className="overflow-y-auto px-4 py-3"
@@ -547,7 +907,6 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
         )}
       </div>
 
-      {/* Input */}
       <div className="px-3 pb-3 pt-2" style={{ borderTop: "1px solid var(--ink-rule-soft)" }}>
         <textarea
           ref={inputRef}
@@ -613,14 +972,58 @@ function MercuriusPanel({ open, onClose, cameraStateRef }) {
 export default function Geometry() {
   const idleRef = useRef({ lastInteract: 0 });
   const cameraStateRef = useRef({ azimuth: 0, elevation: 0, region: "Equator" });
+  const controlsRef = useRef(null);
+  const [controlsReady, setControlsReady] = useState(false);
+
   const [hasInteracted, setHasInteracted] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+
+  // Concept tree (macros + children, no passages)
+  const [macros, setMacros] = useState([]);
+  // Focused: { id, label, sub, parent_id, parent_label, passages }
+  const [focusedConcept, setFocusedConcept] = useState(null);
+  // Macro whose children are visible (the focused macro, or the parent of focused child)
+  const [focusedMacroId, setFocusedMacroId] = useState(null);
+  const [childFade, setChildFade] = useState(0);
+  const [cardLoading, setCardLoading] = useState(false);
+  const [targetWorldPos, setTargetWorldPos] = useState(null);
 
   const onFirstInteract = useCallback(() => {
     setHasInteracted((v) => v || true);
   }, []);
 
-  // Global `m` key opens the panel (unless user is typing in an input)
+  // Fetch concept tree on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API}/geometry/concepts`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (!cancelled) setMacros(data.concepts || []);
+      } catch (e) {
+        console.error("failed to load concepts", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fade children in/out when the visible macro changes
+  useEffect(() => {
+    if (focusedMacroId === null) {
+      // Fade out
+      setChildFade(0);
+      return;
+    }
+    // Fade in
+    setChildFade(0);
+    const t = setTimeout(() => setChildFade(1), 50);
+    return () => clearTimeout(t);
+  }, [focusedMacroId]);
+
+  // 'm' key opens the panel (unless typing)
   useEffect(() => {
     const onKey = (e) => {
       const tag = (e.target?.tagName || "").toLowerCase();
@@ -635,7 +1038,75 @@ export default function Geometry() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Esc closes reading card (panel has its own Esc handler)
+  useEffect(() => {
+    if (!focusedConcept && focusedMacroId === null) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") {
+        // If the panel is open, let its handler take it
+        if (panelOpen) return;
+        e.preventDefault();
+        clearFocus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusedConcept, focusedMacroId, panelOpen]);
+
   const closePanel = useCallback(() => setPanelOpen(false), []);
+
+  const clearFocus = useCallback(() => {
+    setFocusedConcept(null);
+    setFocusedMacroId(null);
+    setTargetWorldPos(null);
+    setCardLoading(false);
+  }, []);
+
+  const fetchConcept = useCallback(async (conceptId) => {
+    setCardLoading(true);
+    try {
+      const res = await fetch(`${API}/geometry/concepts/${conceptId}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setFocusedConcept(data);
+    } catch (e) {
+      console.error("failed to load concept", e);
+      setFocusedConcept({
+        id: conceptId,
+        label: conceptId,
+        sub: null,
+        parent_id: null,
+        parent_label: null,
+        passages: [],
+      });
+    } finally {
+      setCardLoading(false);
+    }
+  }, []);
+
+  const onMacroClick = useCallback(
+    (macroId, worldPos) => {
+      setFocusedMacroId(macroId);
+      setTargetWorldPos(worldPos);
+      fetchConcept(macroId);
+    },
+    [fetchConcept]
+  );
+
+  const onChildClick = useCallback(
+    (childId, worldPos) => {
+      setTargetWorldPos(worldPos);
+      fetchConcept(childId);
+    },
+    [fetchConcept]
+  );
+
+  const onBackgroundClick = useCallback(() => {
+    if (focusedConcept || focusedMacroId !== null) {
+      clearFocus();
+    }
+  }, [focusedConcept, focusedMacroId, clearFocus]);
 
   return (
     <div
@@ -658,6 +1129,17 @@ export default function Geometry() {
             idleRef={idleRef}
             onFirstInteract={onFirstInteract}
             cameraStateRef={cameraStateRef}
+            macros={macros}
+            focusedConcept={focusedConcept}
+            focusedMacroId={focusedMacroId}
+            childFade={childFade}
+            onMacroClick={onMacroClick}
+            onChildClick={onChildClick}
+            onBackgroundClick={onBackgroundClick}
+            targetWorldPos={targetWorldPos}
+            controlsRef={controlsRef}
+            controlsReady={controlsReady}
+            setControlsReady={setControlsReady}
           />
         </Suspense>
       </Canvas>
@@ -682,22 +1164,24 @@ export default function Geometry() {
         </span>
       </div>
 
-      {/* Bottom-left hint, fades on interact */}
-      <div
-        className={`absolute bottom-10 left-8 font-serif italic text-base pointer-events-none ${
-          !hasInteracted ? "hint-fade" : ""
-        }`}
-        style={{
-          color: "var(--ink-text-dim)",
-          opacity: hasInteracted ? 0 : undefined,
-          transition: "opacity 1.2s",
-        }}
-        data-testid="geometry-hint"
-      >
-        orbit to change what this is
-      </div>
+      {/* Bottom-left hint, fades on interact (hidden when card is open) */}
+      {!focusedConcept && (
+        <div
+          className={`absolute bottom-10 left-8 font-serif italic text-base pointer-events-none ${
+            !hasInteracted ? "hint-fade" : ""
+          }`}
+          style={{
+            color: "var(--ink-text-dim)",
+            opacity: hasInteracted ? 0 : undefined,
+            transition: "opacity 1.2s",
+          }}
+          data-testid="geometry-hint"
+        >
+          orbit · click a node · press m
+        </div>
+      )}
 
-      {/* Bottom-right legend + m-hint */}
+      {/* Bottom-right legend */}
       <div
         className="absolute bottom-10 right-8 font-ui text-[10px] uppercase tracking-[0.2em] text-right pointer-events-none"
         style={{ color: "var(--ink-text-faint)" }}
@@ -708,6 +1192,13 @@ export default function Geometry() {
           press <span style={{ fontFamily: "Inter Tight, monospace" }}>m</span> · ask from here
         </div>
       </div>
+
+      {/* Reading card */}
+      <ReadingCard
+        concept={focusedConcept}
+        loading={cardLoading}
+        onClose={clearFocus}
+      />
 
       {/* Floating Mercurius panel */}
       <MercuriusPanel
